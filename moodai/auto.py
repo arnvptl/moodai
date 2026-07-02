@@ -13,7 +13,7 @@ MOODLE_BASE_URL = "http://103.117.208.19/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
 
-USERNAME = os.getenv("MOODLE_USERNAME", "2402111144") # Fallback to default if not set
+USERNAME = os.getenv("MOODLE_USERNAME")
 PASSWORD = os.getenv("MOODLE_PASSWORD")
 AI_API_KEY = os.getenv("AI_API_KEY")
 
