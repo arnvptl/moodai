@@ -2,7 +2,7 @@ import time
 import requests
 import re
 import os
-import google.generativeai as genai
+from google import genai
 from bs4 import BeautifulSoup
 import json
 
@@ -22,8 +22,8 @@ if not PASSWORD or not AI_API_KEY:
     exit(1)
 
 # Configure the AI Studio API (using the Google GenAI SDK as an example)
-genai.configure(api_key=AI_API_KEY)
-model = genai.GenerativeModel('gemini-3.1-flash-lite')
+client = genai.Client(api_key=AI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 def get_login_token(html_content):
     """Extracts the Moodle logintoken from the login page HTML."""
@@ -160,7 +160,11 @@ def process_workflow():
                     print(f"Querying AI Studio for {filename}...")
                     try:
                         # Call the AI API
-                        ai_response = model.generate_content(questions)
+                        ai_response = client.models.generate_content(
+                            model=MODEL_NAME,
+                            contents=questions,
+                        )
+
                         answers = ai_response.text
                         print("Answers generated successfully.")
                         
