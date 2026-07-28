@@ -26,7 +26,7 @@ if not USERNAME or not PASSWORD or not AI_API_KEY:
 
 # Configure the AI Studio API (using the Google GenAI SDK as an example)
 client = genai.Client(api_key=AI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_NAME = "gemini-2.5-flash"
 
 def get_login_token(html_content):
     """Extracts the Moodle logintoken from the login page HTML."""
