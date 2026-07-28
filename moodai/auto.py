@@ -64,11 +64,22 @@ def process_workflow():
     processed_timestamps = {}
     current_sleep = 30  # Start by checking every 30 seconds
     
+    print(f"MoodAI Worker started.")
+    print(f"Target: {MOODLE_BASE_URL}")
+    print(f"Username: {USERNAME}")
+    print(f"Password set: {bool(PASSWORD)}")
+    print(f"API Key set: {bool(AI_API_KEY)}")
+    
     while True:
         # Recreate session to force Moodle to generate a new draft area with updated files
         session = requests.Session()
         print(f"Checking for files at {FILES_URL}...")
-        response = session.get(FILES_URL)
+        try:
+            response = session.get(FILES_URL, timeout=30)
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR: Could not connect to Moodle server: {e}")
+            time.sleep(current_sleep)
+            continue
         
         # Moodle might return 303 Redirect or 200 OK with the login form
         if "name=\"logintoken\"" in response.text or response.status_code == 303:
