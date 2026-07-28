@@ -139,8 +139,11 @@ def process_workflow():
                 continue
                 
             files_to_process = []
-            for f_info in files_list.get('list', []):
+            all_files = files_list.get('list', [])
+            print(f"Total files in Moodle private files: {len(all_files)}")
+            for f_info in all_files:
                 filename = f_info.get('filename', '')
+                print(f"  Found: {filename} (modified: {f_info.get('datemodified', 'N/A')})")
                 # Process any .txt file that is NOT an answer file
                 if filename.endswith('.txt') and not filename.startswith('answers_') and filename != 'answers.txt':
                     questions_datemodified = f_info.get('datemodified', 0)
