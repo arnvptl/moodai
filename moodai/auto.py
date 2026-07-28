@@ -17,8 +17,11 @@ USERNAME = os.getenv("MOODLE_USERNAME")
 PASSWORD = os.getenv("MOODLE_PASSWORD")
 AI_API_KEY = os.getenv("AI_API_KEY")
 
-if not PASSWORD or not AI_API_KEY:
-    print("Error: MOODLE_PASSWORD and AI_API_KEY environment variables must be set.")
+if not USERNAME or not PASSWORD or not AI_API_KEY:
+    print("Error: MOODLE_USERNAME, MOODLE_PASSWORD, and AI_API_KEY environment variables must be set.")
+    print(f"  MOODLE_USERNAME set: {bool(USERNAME)}")
+    print(f"  MOODLE_PASSWORD set: {bool(PASSWORD)}")
+    print(f"  AI_API_KEY set: {bool(AI_API_KEY)}")
     exit(1)
 
 # Configure the AI Studio API (using the Google GenAI SDK as an example)
@@ -102,13 +105,28 @@ def process_workflow():
             }
             
             # Submit the login form
-            session.post(LOGIN_URL, data=login_data)
+            login_response = session.post(LOGIN_URL, data=login_data)
+            print(f"Login POST status: {login_response.status_code}")
+            print(f"Login POST redirected to: {login_response.url}")
+            
+            # Check for error messages in the login response
+            if 'loginerrors' in login_response.text or 'Invalid login' in login_response.text:
+                print("ERROR: Moodle returned login error - invalid credentials!")
+                time.sleep(current_sleep)
+                continue
             
             # Verify login by attempting to fetch the files page again
-            response = session.get(FILES_URL)
+            response = session.get(FILES_URL, timeout=30)
+            print(f"Files page status after login: {response.status_code}")
+            
+            # Try to extract logged-in username from page
+            logged_in_match = re.search(r'loggedinuser.*?>(.*?)<', response.text)
+            if logged_in_match:
+                print(f"Logged in as: {logged_in_match.group(1).strip()}")
             
             if "name=\"logintoken\"" in response.text:
-                print("Login failed. Please check your credentials.")
+                print("Login failed. Still seeing login form after POST.")
+                print("Check that MOODLE_USERNAME and MOODLE_PASSWORD secrets are correct.")
                 time.sleep(current_sleep)
                 continue
 
