@@ -7,8 +7,6 @@ from bs4 import BeautifulSoup
 import json
 
 # --- Configuration ---
-# IMPORTANT: For security, your specific IP address and credentials have been replaced with placeholders.
-# Please update these variables with your actual details before running the script.
 MOODLE_BASE_URL = "http://103.117.208.19/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
@@ -35,33 +33,147 @@ def get_login_token(html_content):
         return match.group(1)
     return None
 
+def extract_balanced_json(text, start_pos):
+    """Extract a balanced JSON object starting from start_pos (which should point to '{')."""
+    if start_pos >= len(text) or text[start_pos] != '{':
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start_pos, len(text)):
+        c = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if c == '\\' and in_string:
+            escape_next = True
+            continue
+        if c == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start_pos:i+1]
+    return None
+
 def extract_filemanager_params(html_content):
     """Extracts required tokens from the Moodle files page."""
     soup = BeautifulSoup(html_content, 'html.parser')
     
+    # --- Extract sesskey ---
     sesskey_input = soup.find('input', {'name': 'sesskey'})
     sesskey = sesskey_input.get('value') if sesskey_input else None
     if not sesskey:
         sesskey_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', html_content)
         sesskey = sesskey_match.group(1) if sesskey_match else None
     
-    draft_input = soup.find('input', {'name': 'files_filemanager'})
-    if not draft_input:
-        draft_input = soup.find('input', id=re.compile(r'id_files_filemanager'))
-    draftitemid = draft_input.get('value') if draft_input else None
-    if not draftitemid:
-        itemid_match = re.search(r'itemid=(\d+)', html_content)
-        if not itemid_match:
-            itemid_match = re.search(r'"itemid"\s*:\s*(\d+)', html_content)
-        draftitemid = itemid_match.group(1) if itemid_match else None
+    # --- Extract filemanager init data from JavaScript ---
+    # Moodle embeds the filemanager config (with itemid, client_id, and existing files)
+    # in a Y.use / M.form_filemanager.init call in the page's JavaScript.
+    fm_init_data = None
     
-    client_id_match = re.search(r'id="filemanager-([a-zA-Z0-9]+)"', html_content)
-    client_id = client_id_match.group(1) if client_id_match else None
+    # Pattern 1: M.form_filemanager.init(Y, {...});
+    fm_match = re.search(r'M\.form_filemanager\.init\s*\(\s*Y\s*,\s*', html_content)
+    if fm_match:
+        json_str = extract_balanced_json(html_content, fm_match.end())
+        if json_str:
+            try:
+                fm_init_data = json.loads(json_str)
+                print(f"DEBUG: Found M.form_filemanager.init data with keys: {list(fm_init_data.keys())}")
+            except json.JSONDecodeError as e:
+                print(f"DEBUG: Failed to parse filemanager init JSON: {e}")
+                print(f"DEBUG: Raw JSON string (first 500 chars): {json_str[:500]}")
+    
+    # Pattern 2: initializer_for form_filemanager in require() call  
+    if not fm_init_data:
+        fm_match2 = re.search(r'"form_filemanager"\s*,\s*', html_content)
+        if fm_match2:
+            json_str2 = extract_balanced_json(html_content, fm_match2.end())
+            if json_str2:
+                try:
+                    fm_init_data = json.loads(json_str2)
+                    print(f"DEBUG: Found form_filemanager data (pattern 2) with keys: {list(fm_init_data.keys())}")
+                except json.JSONDecodeError:
+                    pass
+    
+    # Pattern 3: Look for any JSON block containing both "itemid" and "client_id" near "filemanager"
+    if not fm_init_data:
+        for fm_match3 in re.finditer(r'filemanager', html_content, re.IGNORECASE):
+            search_start = fm_match3.start()
+            brace_pos = html_content.find('{', search_start)
+            if brace_pos != -1 and brace_pos - search_start < 300:
+                json_str3 = extract_balanced_json(html_content, brace_pos)
+                if json_str3 and '"itemid"' in json_str3 and '"client_id"' in json_str3:
+                    try:
+                        fm_init_data = json.loads(json_str3)
+                        print(f"DEBUG: Found filemanager data (pattern 3) with keys: {list(fm_init_data.keys())}")
+                        break
+                    except json.JSONDecodeError:
+                        continue
+    
+    if not fm_init_data:
+        # Dump HTML context around 'filemanager' for debugging
+        fm_pos = html_content.lower().find('filemanager')
+        if fm_pos != -1:
+            start = max(0, fm_pos - 200)
+            end = min(len(html_content), fm_pos + 2000)
+            print(f"DEBUG: No filemanager init data found. HTML around 'filemanager' (pos {fm_pos}):")
+            print(html_content[start:end])
+        else:
+            print("DEBUG: 'filemanager' not found anywhere in the page HTML!")
+    
+    # --- Extract draftitemid ---
+    draftitemid = None
+    if fm_init_data:
+        draftitemid = str(fm_init_data.get('itemid', '')) or None
+        print(f"DEBUG: itemid from JS init data: {draftitemid}")
+    
+    if not draftitemid:
+        draft_input = soup.find('input', {'name': 'files_filemanager'})
+        if not draft_input:
+            draft_input = soup.find('input', id=re.compile(r'id_files_filemanager'))
+        draftitemid = draft_input.get('value') if draft_input else None
+        print(f"DEBUG: itemid from HTML input: {draftitemid}")
+    
+    if not draftitemid:
+        # Try broader regex patterns
+        itemid_match = re.search(r'"itemid"\s*:\s*(\d+)', html_content)
+        if not itemid_match:
+            itemid_match = re.search(r'itemid=(\d+)', html_content)
+        draftitemid = itemid_match.group(1) if itemid_match else None
+        print(f"DEBUG: itemid from regex fallback: {draftitemid}")
+    
+    # --- Extract client_id ---
+    client_id = None
+    if fm_init_data:
+        client_id = fm_init_data.get('client_id')
+        print(f"DEBUG: client_id from JS init data: {client_id}")
+    
     if not client_id:
-        client_id_match = re.search(r'"client_id"\s*:\s*"([^"]+)"', html_content)
+        client_id_match = re.search(r'id="filemanager-([a-zA-Z0-9]+)"', html_content)
         client_id = client_id_match.group(1) if client_id_match else None
-        
-    return sesskey, draftitemid, client_id, soup
+        if not client_id:
+            client_id_match = re.search(r'"client_id"\s*:\s*"([^"]+)"', html_content)
+            client_id = client_id_match.group(1) if client_id_match else None
+        print(f"DEBUG: client_id from HTML/regex: {client_id}")
+    
+    # --- Extract files already listed in the JS init data (fallback) ---
+    js_files = []
+    if fm_init_data and 'list' in fm_init_data:
+        js_files = fm_init_data['list']
+        # The list might be a dict (keyed by filename) or a list
+        if isinstance(js_files, dict):
+            js_files = list(js_files.values())
+        print(f"DEBUG: Found {len(js_files)} files embedded in JS init data")
+        for jf in js_files:
+            print(f"  JS file: {jf.get('filename', 'unknown')}")
+    
+    return sesskey, draftitemid, client_id, soup, js_files
 
 def process_workflow():
     processed_timestamps = {}
@@ -132,7 +244,9 @@ def process_workflow():
 
         # If we successfully accessed the files page
         if response.status_code == 200 and "name=\"logintoken\"" not in response.text:
-            sesskey, draftitemid, client_id, soup = extract_filemanager_params(response.text)
+            sesskey, draftitemid, client_id, soup, js_files = extract_filemanager_params(response.text)
+            
+            print(f"DEBUG: Extracted params -> sesskey={sesskey}, draftitemid={draftitemid}, client_id={client_id}")
             
             if not all([sesskey, draftitemid, client_id]):
                 print(f"Failed to extract parameters: sesskey={sesskey}, draftitemid={draftitemid}, client_id={client_id}")
@@ -149,6 +263,8 @@ def process_workflow():
             }
             
             list_response = session.post(list_url, data=list_data)
+            print(f"DEBUG: Draft files AJAX status: {list_response.status_code}")
+            print(f"DEBUG: Draft files AJAX response (first 1000 chars): {list_response.text[:1000]}")
             try:
                 files_list = list_response.json()
             except Exception as e:
@@ -158,6 +274,12 @@ def process_workflow():
                 
             files_to_process = []
             all_files = files_list.get('list', [])
+            
+            # If AJAX returned no files but we got files from the JS init data, use those
+            if not all_files and js_files:
+                print(f"AJAX returned 0 files but JS init data has {len(js_files)} files. Using JS data.")
+                all_files = js_files
+            
             print(f"Total files in Moodle private files: {len(all_files)}")
             for f_info in all_files:
                 filename = f_info.get('filename', '')
