@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 import json
 
 # --- Configuration ---
-MOODLE_BASE_URL = "http://103.117.208.19/moodle"
+MOODLE_BASE_URL = "http://103.117.208.18/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
 
