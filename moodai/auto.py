@@ -28,12 +28,8 @@ if not USERNAME or not PASSWORD or not AI_API_KEY:
 # --- AI Provider Setup ---
 gemini_client = genai.Client(api_key=AI_API_KEY)
 
-# Fallback provider API keys (all optional)
+# Groq fallback (optional, needs GROQ_API_KEY)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# Initialize fallback clients
 groq_client = None
 if GROQ_API_KEY:
     try:
@@ -44,53 +40,23 @@ if GROQ_API_KEY:
     except Exception as e:
         print(f"WARNING: Could not init Groq: {e}")
 
-cerebras_client = None
-if CEREBRAS_API_KEY:
-    try:
-        from cerebras.cloud.sdk import Cerebras
-        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
-    except ImportError:
-        print("WARNING: cerebras_cloud_sdk not installed. pip install cerebras_cloud_sdk")
-    except Exception as e:
-        print(f"WARNING: Could not init Cerebras: {e}")
-
-openrouter_client = None
-if OPENROUTER_API_KEY:
-    try:
-        from openai import OpenAI
-        openrouter_client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY,
-        )
-    except ImportError:
-        print("WARNING: openai package not installed. pip install openai")
-    except Exception as e:
-        print(f"WARNING: Could not init OpenRouter: {e}")
-
 # --- Ordered Fallback Chain ---
 # Each entry: (provider, model_id)
 # Tried in EXACTLY this order. On ANY error, immediately skip to next.
 FALLBACK_CHAIN = [
-    ("gemini",     "gemini-2.5-flash"),                          # 1. Gemini 2.5 Flash
-    ("openrouter", "qwen/qwen3-coder"),                         # 2. Qwen 3 Coder (480B MoE)
-    ("groq",       "qwen/qwen3-32b"),                           # 3. Qwen 3 32B
-    ("groq",       "openai/gpt-oss-120b"),                      # 4. GPT-OSS 120B
-    ("groq",       "moonshotai/kimi-k2-instruct-0905"),         # 5. Kimi K2
-    ("groq",       "llama-3.3-70b-versatile"),                  # 6. Llama 3.3 70B Versatile
-    ("groq",       "meta-llama/llama-4-scout-17b-16e-instruct"),# 7. Llama 4 Scout
-    ("openrouter", "deepseek/deepseek-v4-flash"),               # 8. DeepSeek V4 Flash
-    ("gemini",     "gemini-3.5-flash-lite"),                    # 9. Gemini 3.5 Flash Lite
-    ("openrouter", "mistralai/mistral-small"),                  # 10. Mistral Small
+    ("gemini", "gemini-3.5-flash"),              # 1. Gemini 3.5 Flash (primary)
+    ("groq",   "openai/gpt-oss-120b"),           # 2. GPT-OSS 120B
+    ("groq",   "qwen/qwen3.6-27b"),              # 3. Qwen 3.6 27B
+    ("groq",   "llama-3.3-70b-versatile"),        # 4. Llama 3.3 70B Versatile
+    ("groq",   "openai/gpt-oss-20b"),            # 5. GPT-OSS 20B
+    ("groq",   "llama-3.1-8b-instant"),          # 6. Llama 3.1 8B (fast fallback)
+    ("gemini", "gemini-3.5-flash-lite"),          # 7. Gemini 3.5 Flash Lite
 ]
 
 # Print startup summary
-enabled = []
-if groq_client: enabled.append("Groq")
-if cerebras_client: enabled.append("Cerebras")
-if openrouter_client: enabled.append("OpenRouter")
-print(f"AI fallback chain: {len(FALLBACK_CHAIN)} models | Providers: Gemini{', ' + ', '.join(enabled) if enabled else ' only'}")
+print(f"AI fallback chain: {len(FALLBACK_CHAIN)} models | Groq: {'enabled' if groq_client else 'disabled'}")
 for i, (prov, model) in enumerate(FALLBACK_CHAIN, 1):
-    print(f"  {i:>2}. [{prov}] {model}")
+    print(f"  {i}. [{prov}] {model}")
 
 # System prompt: write like a beginner Java programmer
 SYSTEM_PROMPT = (
@@ -113,19 +79,23 @@ def _call_gemini(model, prompt):
         contents=prompt,
         config=genai.types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=2048,
+            temperature=0.2,
         ),
     )
     return resp.text
 
 
 def _call_openai_compat(client, model, prompt):
-    """Call any OpenAI-compatible API (Groq, Cerebras, OpenRouter). Returns answer text or raises."""
+    """Call any OpenAI-compatible API (Groq). Returns answer text or raises."""
     resp = client.chat.completions.create(
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        model=model,
+        max_tokens=2048,
+        temperature=0.2,
     )
     return resp.choices[0].message.content
 
@@ -142,10 +112,6 @@ def call_ai(prompt):
             client_obj = gemini_client  # always available
         elif provider == "groq":
             client_obj = groq_client
-        elif provider == "cerebras":
-            client_obj = cerebras_client
-        elif provider == "openrouter":
-            client_obj = openrouter_client
         else:
             continue
         
@@ -162,12 +128,12 @@ def call_ai(prompt):
                 answer = _call_openai_compat(client_obj, model, prompt)
             
             if answer and answer.strip():
-                print(f"  [{provider}/{model}] ✓ Success!")
+                print(f"  [{provider}/{model}] Success!")
                 return answer, f"{provider}/{model}"
             else:
                 print(f"  [{provider}/{model}] Empty response, trying next...")
         except Exception as e:
-            print(f"  [{provider}/{model}] ✗ Failed: {e}")
+            print(f"  [{provider}/{model}] Failed: {e}")
             errors.append(f"{provider}/{model}: {e}")
             continue  # Immediately try next — no waiting
     
