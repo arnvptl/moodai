@@ -1,7 +1,10 @@
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import re
 import os
+import traceback
 from google import genai
 from bs4 import BeautifulSoup
 import json
@@ -22,9 +25,153 @@ if not USERNAME or not PASSWORD or not AI_API_KEY:
     print(f"  AI_API_KEY set: {bool(AI_API_KEY)}")
     exit(1)
 
-# Configure the AI Studio API (using the Google GenAI SDK as an example)
-client = genai.Client(api_key=AI_API_KEY)
-MODEL_NAME = "gemini-3.5-flash-lite"
+# --- AI Provider Setup ---
+gemini_client = genai.Client(api_key=AI_API_KEY)
+
+# Fallback provider API keys (all optional)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# Initialize fallback clients
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        from groq import Groq
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except ImportError:
+        print("WARNING: groq package not installed. pip install groq")
+    except Exception as e:
+        print(f"WARNING: Could not init Groq: {e}")
+
+cerebras_client = None
+if CEREBRAS_API_KEY:
+    try:
+        from cerebras.cloud.sdk import Cerebras
+        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+    except ImportError:
+        print("WARNING: cerebras_cloud_sdk not installed. pip install cerebras_cloud_sdk")
+    except Exception as e:
+        print(f"WARNING: Could not init Cerebras: {e}")
+
+openrouter_client = None
+if OPENROUTER_API_KEY:
+    try:
+        from openai import OpenAI
+        openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+    except ImportError:
+        print("WARNING: openai package not installed. pip install openai")
+    except Exception as e:
+        print(f"WARNING: Could not init OpenRouter: {e}")
+
+# --- Ordered Fallback Chain ---
+# Each entry: (provider, model_id)
+# Tried in EXACTLY this order. On ANY error, immediately skip to next.
+FALLBACK_CHAIN = [
+    ("gemini",     "gemini-2.5-flash"),                          # 1. Gemini 2.5 Flash
+    ("openrouter", "qwen/qwen3-coder"),                         # 2. Qwen 3 Coder (480B MoE)
+    ("groq",       "qwen/qwen3-32b"),                           # 3. Qwen 3 32B
+    ("groq",       "openai/gpt-oss-120b"),                      # 4. GPT-OSS 120B
+    ("groq",       "moonshotai/kimi-k2-instruct-0905"),         # 5. Kimi K2
+    ("groq",       "llama-3.3-70b-versatile"),                  # 6. Llama 3.3 70B Versatile
+    ("groq",       "meta-llama/llama-4-scout-17b-16e-instruct"),# 7. Llama 4 Scout
+    ("openrouter", "deepseek/deepseek-v4-flash"),               # 8. DeepSeek V4 Flash
+    ("gemini",     "gemini-3.5-flash-lite"),                    # 9. Gemini 3.5 Flash Lite
+    ("openrouter", "mistralai/mistral-small"),                  # 10. Mistral Small
+]
+
+# Print startup summary
+enabled = []
+if groq_client: enabled.append("Groq")
+if cerebras_client: enabled.append("Cerebras")
+if openrouter_client: enabled.append("OpenRouter")
+print(f"AI fallback chain: {len(FALLBACK_CHAIN)} models | Providers: Gemini{', ' + ', '.join(enabled) if enabled else ' only'}")
+for i, (prov, model) in enumerate(FALLBACK_CHAIN, 1):
+    print(f"  {i:>2}. [{prov}] {model}")
+
+# System prompt: write like a beginner Java programmer
+SYSTEM_PROMPT = (
+    "You are a college student who is learning Java programming. "
+    "Write code like a beginner - it doesn't have to be the cleanest or most optimized, "
+    "but it should work correctly and get the job done. "
+    "Use simple variable names, basic loops, and straightforward logic. "
+    "Always include all necessary import statements at the top. "
+    "For GUI programs, use javax.swing (JFrame, JPanel, JButton, etc.) and java.awt. "
+    "Don't use advanced design patterns or lambda expressions unless absolutely needed. "
+    "Keep it simple and functional - like a student who just learned the topic would write it. "
+    "If the question is not about Java, just answer it normally in a simple and direct way."
+)
+
+
+def _call_gemini(model, prompt):
+    """Call Gemini API. Returns answer text or raises."""
+    resp = gemini_client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=genai.types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+        ),
+    )
+    return resp.text
+
+
+def _call_openai_compat(client, model, prompt):
+    """Call any OpenAI-compatible API (Groq, Cerebras, OpenRouter). Returns answer text or raises."""
+    resp = client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        model=model,
+    )
+    return resp.choices[0].message.content
+
+
+def call_ai(prompt):
+    """Try each model in FALLBACK_CHAIN in order. On ANY error, immediately try next.
+    Returns (answer_text, provider/model) or raises if ALL fail."""
+    
+    errors = []
+    
+    for provider, model in FALLBACK_CHAIN:
+        # Pick the right client
+        if provider == "gemini":
+            client_obj = gemini_client  # always available
+        elif provider == "groq":
+            client_obj = groq_client
+        elif provider == "cerebras":
+            client_obj = cerebras_client
+        elif provider == "openrouter":
+            client_obj = openrouter_client
+        else:
+            continue
+        
+        # Skip if provider not configured
+        if client_obj is None:
+            print(f"  [{provider}/{model}] Skipped (no API key)")
+            continue
+        
+        try:
+            print(f"  [{provider}/{model}] Trying...")
+            if provider == "gemini":
+                answer = _call_gemini(model, prompt)
+            else:
+                answer = _call_openai_compat(client_obj, model, prompt)
+            
+            if answer and answer.strip():
+                print(f"  [{provider}/{model}] ✓ Success!")
+                return answer, f"{provider}/{model}"
+            else:
+                print(f"  [{provider}/{model}] Empty response, trying next...")
+        except Exception as e:
+            print(f"  [{provider}/{model}] ✗ Failed: {e}")
+            errors.append(f"{provider}/{model}: {e}")
+            continue  # Immediately try next — no waiting
+    
+    raise Exception(f"ALL {len(FALLBACK_CHAIN)} models failed. Errors: {'; '.join(errors[-3:])}")
 
 def get_login_token(html_content):
     """Extracts the Moodle logintoken from the login page HTML."""
@@ -184,10 +331,23 @@ def process_workflow():
     print(f"Username: {USERNAME}")
     print(f"Password set: {bool(PASSWORD)}")
     print(f"API Key set: {bool(AI_API_KEY)}")
+    print(f"Groq fallback: {'enabled' if groq_client else 'disabled'}")
+    print(f"Gemini model: {GEMINI_MODEL}")
     
     while True:
+      try:
         # Recreate session to force Moodle to generate a new draft area with updated files
         session = requests.Session()
+        # Add retry logic for transient connection errors
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         print(f"Checking for files at {FILES_URL}...")
         try:
             response = session.get(FILES_URL, timeout=30)
@@ -200,45 +360,51 @@ def process_workflow():
         if "name=\"logintoken\"" in response.text or response.status_code == 303:
             print("Authentication required. Logging in...")
             
-            # Fetch the login page to get a fresh logintoken and session cookie
-            login_page = session.get(LOGIN_URL)
-            logintoken = get_login_token(login_page.text)
-            
-            if not logintoken:
-                print("Could not find logintoken on the login page. Retrying in 60s...")
-                time.sleep(60)
-                continue
+            try:
+                # Fetch the login page to get a fresh logintoken and session cookie
+                login_page = session.get(LOGIN_URL, timeout=30)
+                logintoken = get_login_token(login_page.text)
+                
+                if not logintoken:
+                    print("Could not find logintoken on the login page. Retrying in 60s...")
+                    time.sleep(60)
+                    continue
 
-            login_data = {
-                'username': USERNAME,
-                'password': PASSWORD,
-                'logintoken': logintoken,
-                'anchor': ''
-            }
-            
-            # Submit the login form
-            login_response = session.post(LOGIN_URL, data=login_data)
-            print(f"Login POST status: {login_response.status_code}")
-            print(f"Login POST redirected to: {login_response.url}")
-            
-            # Check for error messages in the login response
-            if 'loginerrors' in login_response.text or 'Invalid login' in login_response.text:
-                print("ERROR: Moodle returned login error - invalid credentials!")
-                time.sleep(current_sleep)
-                continue
-            
-            # Verify login by attempting to fetch the files page again
-            response = session.get(FILES_URL, timeout=30)
-            print(f"Files page status after login: {response.status_code}")
-            
-            # Try to extract logged-in username from page
-            logged_in_match = re.search(r'loggedinuser.*?>(.*?)<', response.text)
-            if logged_in_match:
-                print(f"Logged in as: {logged_in_match.group(1).strip()}")
-            
-            if "name=\"logintoken\"" in response.text:
-                print("Login failed. Still seeing login form after POST.")
-                print("Check that MOODLE_USERNAME and MOODLE_PASSWORD secrets are correct.")
+                login_data = {
+                    'username': USERNAME,
+                    'password': PASSWORD,
+                    'logintoken': logintoken,
+                    'anchor': ''
+                }
+                
+                # Submit the login form
+                login_response = session.post(LOGIN_URL, data=login_data, timeout=30)
+                print(f"Login POST status: {login_response.status_code}")
+                print(f"Login POST redirected to: {login_response.url}")
+                
+                # Check for error messages in the login response
+                if 'loginerrors' in login_response.text or 'Invalid login' in login_response.text:
+                    print("ERROR: Moodle returned login error - invalid credentials!")
+                    time.sleep(current_sleep)
+                    continue
+                
+                # Verify login by attempting to fetch the files page again
+                response = session.get(FILES_URL, timeout=30)
+                print(f"Files page status after login: {response.status_code}")
+                
+                # Try to extract logged-in username from page
+                logged_in_match = re.search(r'loggedinuser.*?>(.+?)<', response.text)
+                if logged_in_match:
+                    print(f"Logged in as: {logged_in_match.group(1).strip()}")
+                
+                if "name=\"logintoken\"" in response.text:
+                    print("Login failed. Still seeing login form after POST.")
+                    print("Check that MOODLE_USERNAME and MOODLE_PASSWORD secrets are correct.")
+                    time.sleep(current_sleep)
+                    continue
+            except requests.exceptions.RequestException as e:
+                print(f"ERROR: Connection error during login: {e}")
+                print(f"Retrying in {current_sleep} seconds...")
                 time.sleep(current_sleep)
                 continue
 
@@ -262,7 +428,12 @@ def process_workflow():
                 'itemid': draftitemid
             }
             
-            list_response = session.post(list_url, data=list_data)
+            try:
+                list_response = session.post(list_url, data=list_data, timeout=30)
+            except requests.exceptions.RequestException as e:
+                print(f"ERROR: Draft files AJAX request failed: {e}")
+                time.sleep(current_sleep)
+                continue
             print(f"DEBUG: Draft files AJAX status: {list_response.status_code}")
             print(f"DEBUG: Draft files AJAX response (first 1000 chars): {list_response.text[:1000]}")
             try:
@@ -304,23 +475,22 @@ def process_workflow():
                 questions_datemodified = f_info['datemodified']
                 
                 print(f"Downloading {filename} from {questions_url}...")
-                file_response = session.get(questions_url)
+                try:
+                    file_response = session.get(questions_url, timeout=30)
+                except requests.exceptions.RequestException as e:
+                    print(f"ERROR: Failed to download {filename}: {e}")
+                    continue
                 
                 if file_response.status_code == 200:
                     print(f"File {filename} downloaded successfully!")
                     questions = file_response.text
                     print(f"Questions:\n{questions}\n")
                     
-                    print(f"Querying AI Studio for {filename}...")
+                    print(f"Querying AI for {filename}...")
                     try:
-                        # Call the AI API
-                        ai_response = client.models.generate_content(
-                            model=MODEL_NAME,
-                            contents=questions,
-                        )
-
-                        answers = ai_response.text
-                        print("Answers generated successfully.")
+                        # Call AI with automatic Gemini -> Groq fallback
+                        answers, provider = call_ai(questions)
+                        print(f"Answers generated successfully via {provider}.")
                         
                         if filename == 'questions.txt':
                             answers_filename = 'answers.txt'
@@ -354,7 +524,10 @@ def process_workflow():
                             files = {'repo_upload_file': f} # Moodle expects this field name
                             
                             try:
-                                upload_res = session.post(upload_url, data=upload_data, files=files).json()
+                                upload_res = session.post(upload_url, data=upload_data, files=files, timeout=60).json()
+                            except requests.exceptions.RequestException as e:
+                                print(f"ERROR: Upload request failed for {answers_filename}: {e}")
+                                upload_res = {'error': True}
                             except Exception as e:
                                 print(f"JSON Decode Error (Upload response might not be JSON): {e}")
                                 upload_res = {'error': True}
@@ -388,21 +561,31 @@ def process_workflow():
                 save_data['files_filemanager'] = draftitemid
                 save_data['submitbutton'] = 'Save changes'
                 
-                save_res = session.post(FILES_URL, data=save_data)
-                
-                if save_res.status_code == 200:
-                    print("Upload complete. Saved all new files to private files.")
-                    # SUCCESSFUL UPLOAD: Change polling interval to 15 minutes!
-                    current_sleep = 900
-                    print("Switching to 15-minute polling interval...")
-                else:
-                    print(f"Failed to save to private files. Status: {save_res.status_code}")
+                try:
+                    save_res = session.post(FILES_URL, data=save_data, timeout=30)
+                    
+                    if save_res.status_code == 200:
+                        print("Upload complete. Saved all new files to private files.")
+                        # SUCCESSFUL UPLOAD: Change polling interval to 15 minutes!
+                        current_sleep = 900
+                        print("Switching to 15-minute polling interval...")
+                    else:
+                        print(f"Failed to save to private files. Status: {save_res.status_code}")
+                except requests.exceptions.RequestException as e:
+                    print(f"ERROR: Failed to save to private files: {e}")
 
             print(f"Waiting {current_sleep} seconds before next cycle...")
             time.sleep(current_sleep)
         else:
             print(f"Unexpected status or content on files page. Status Code: {response.status_code}")
             time.sleep(current_sleep)
+
+      except Exception as e:
+        # Top-level safety net: catch ANY unexpected error so the worker never dies
+        print(f"CRITICAL: Unexpected error in main loop: {e}")
+        traceback.print_exc()
+        print(f"Recovering... waiting {current_sleep} seconds before next cycle.")
+        time.sleep(current_sleep)
 
 if __name__ == "__main__":
     # Session is recreated per cycle to avoid sticky draft areas
