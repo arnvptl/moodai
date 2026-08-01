@@ -331,8 +331,6 @@ def process_workflow():
     print(f"Username: {USERNAME}")
     print(f"Password set: {bool(PASSWORD)}")
     print(f"API Key set: {bool(AI_API_KEY)}")
-    print(f"Groq fallback: {'enabled' if groq_client else 'disabled'}")
-    print(f"Gemini model: {GEMINI_MODEL}")
     
     while True:
       try:
