@@ -79,7 +79,6 @@ def _call_gemini(model, prompt):
         contents=prompt,
         config=genai.types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=2048,
             temperature=0.2,
         ),
     )
@@ -94,7 +93,6 @@ def _call_openai_compat(client, model, prompt):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=2048,
         temperature=0.2,
     )
     return resp.choices[0].message.content
