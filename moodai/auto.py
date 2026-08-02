@@ -4,61 +4,47 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import re
 import os
+import io
 import traceback
 from google import genai
-from bs4 import BeautifulSoup
 import json
 
 # --- Configuration ---
 MOODLE_BASE_URL = "http://103.117.208.18/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
+POLL_INTERVAL = 5  # seconds between checks
 
 USERNAME = os.getenv("MOODLE_USERNAME")
 PASSWORD = os.getenv("MOODLE_PASSWORD")
 AI_API_KEY = os.getenv("AI_API_KEY")
 
 if not USERNAME or not PASSWORD or not AI_API_KEY:
-    print("Error: MOODLE_USERNAME, MOODLE_PASSWORD, and AI_API_KEY environment variables must be set.")
-    print(f"  MOODLE_USERNAME set: {bool(USERNAME)}")
-    print(f"  MOODLE_PASSWORD set: {bool(PASSWORD)}")
-    print(f"  AI_API_KEY set: {bool(AI_API_KEY)}")
+    print("Error: MOODLE_USERNAME, MOODLE_PASSWORD, and AI_API_KEY must be set.")
     exit(1)
 
-# --- AI Provider Setup ---
+# --- AI Setup ---
 gemini_client = genai.Client(api_key=AI_API_KEY)
 
-# Groq fallback (optional, needs GROQ_API_KEY)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = None
 if GROQ_API_KEY:
     try:
         from groq import Groq
         groq_client = Groq(api_key=GROQ_API_KEY)
-    except ImportError:
-        print("WARNING: groq package not installed. pip install groq")
-    except Exception as e:
-        print(f"WARNING: Could not init Groq: {e}")
+    except (ImportError, Exception) as e:
+        print(f"WARNING: Groq unavailable: {e}")
 
-# --- Ordered Fallback Chain ---
-# Each entry: (provider, model_id)
-# Tried in EXACTLY this order. On ANY error, immediately skip to next.
 FALLBACK_CHAIN = [
-    ("gemini", "gemini-3.5-flash"),              # 1. Gemini 3.5 Flash (primary)
-    ("groq",   "openai/gpt-oss-120b"),           # 2. GPT-OSS 120B
-    ("groq",   "qwen/qwen3.6-27b"),              # 3. Qwen 3.6 27B
-    ("groq",   "llama-3.3-70b-versatile"),        # 4. Llama 3.3 70B Versatile
-    ("groq",   "openai/gpt-oss-20b"),            # 5. GPT-OSS 20B
-    ("groq",   "llama-3.1-8b-instant"),          # 6. Llama 3.1 8B (fast fallback)
-    ("gemini", "gemini-3.5-flash-lite"),          # 7. Gemini 3.5 Flash Lite
+    ("gemini", "gemini-3.5-flash"),
+    ("groq",   "openai/gpt-oss-120b"),
+    ("groq",   "qwen/qwen3.6-27b"),
+    ("groq",   "llama-3.3-70b-versatile"),
+    ("groq",   "openai/gpt-oss-20b"),
+    ("groq",   "llama-3.1-8b-instant"),
+    ("gemini", "gemini-3.5-flash-lite"),
 ]
 
-# Print startup summary
-print(f"AI fallback chain: {len(FALLBACK_CHAIN)} models | Groq: {'enabled' if groq_client else 'disabled'}")
-for i, (prov, model) in enumerate(FALLBACK_CHAIN, 1):
-    print(f"  {i}. [{prov}] {model}")
-
-# System prompt: write like a beginner Java programmer
 SYSTEM_PROMPT = (
     "You are a college student who is learning Java programming. "
     "Write code like a beginner - it doesn't have to be the cleanest or most optimized, "
@@ -71,495 +57,334 @@ SYSTEM_PROMPT = (
     "If the question is not about Java, just answer it normally in a simple and direct way."
 )
 
-
-def _call_gemini(model, prompt):
-    """Call Gemini API. Returns answer text or raises."""
-    resp = gemini_client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.2,
-        ),
-    )
-    return resp.text
+print(f"MoodAI | {len(FALLBACK_CHAIN)} models | Groq: {'on' if groq_client else 'off'}")
 
 
-def _call_openai_compat(client, model, prompt):
-    """Call any OpenAI-compatible API (Groq). Returns answer text or raises."""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
-
-
+# --- AI Call with Fallback ---
 def call_ai(prompt):
-    """Try each model in FALLBACK_CHAIN in order. On ANY error, immediately try next.
-    Returns (answer_text, provider/model) or raises if ALL fail."""
-    
+    """Try each model in order. Returns (answer, model_name) or raises."""
     errors = []
-    
     for provider, model in FALLBACK_CHAIN:
-        # Pick the right client
-        if provider == "gemini":
-            client_obj = gemini_client  # always available
-        elif provider == "groq":
-            client_obj = groq_client
-        else:
+        client = gemini_client if provider == "gemini" else groq_client
+        if client is None:
             continue
-        
-        # Skip if provider not configured
-        if client_obj is None:
-            print(f"  [{provider}/{model}] Skipped (no API key)")
-            continue
-        
         try:
-            print(f"  [{provider}/{model}] Trying...")
             if provider == "gemini":
-                answer = _call_gemini(model, prompt)
+                resp = client.models.generate_content(
+                    model=model, contents=prompt,
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT, temperature=0.2,
+                    ),
+                )
+                answer = resp.text
             else:
-                answer = _call_openai_compat(client_obj, model, prompt)
-            
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                )
+                answer = resp.choices[0].message.content
+
             if answer and answer.strip():
-                print(f"  [{provider}/{model}] Success!")
+                print(f"  AI: {provider}/{model} OK")
                 return answer, f"{provider}/{model}"
-            else:
-                print(f"  [{provider}/{model}] Empty response, trying next...")
         except Exception as e:
-            print(f"  [{provider}/{model}] Failed: {e}")
             errors.append(f"{provider}/{model}: {e}")
-            continue  # Immediately try next — no waiting
-    
-    raise Exception(f"ALL {len(FALLBACK_CHAIN)} models failed. Errors: {'; '.join(errors[-3:])}")
+    raise Exception(f"All models failed: {'; '.join(errors[-3:])}")
 
-def get_login_token(html_content):
-    """Extracts the Moodle logintoken from the login page HTML."""
-    match = re.search(r'name="logintoken" value="([^"]+)"', html_content)
-    if match:
-        return match.group(1)
-    return None
 
-def extract_balanced_json(text, start_pos):
-    """Extract a balanced JSON object starting from start_pos (which should point to '{')."""
-    if start_pos >= len(text) or text[start_pos] != '{':
+# --- Moodle Helpers ---
+def _extract_json_block(text, pos):
+    """Extract a balanced {...} JSON object starting at pos."""
+    if pos >= len(text) or text[pos] != '{':
         return None
     depth = 0
-    in_string = False
-    escape_next = False
-    for i in range(start_pos, len(text)):
+    in_str = False
+    esc = False
+    for i in range(pos, len(text)):
         c = text[i]
-        if escape_next:
-            escape_next = False
+        if esc:
+            esc = False
             continue
-        if c == '\\' and in_string:
-            escape_next = True
+        if c == '\\' and in_str:
+            esc = True
             continue
-        if c == '"' and not escape_next:
-            in_string = not in_string
+        if c == '"':
+            in_str = not in_str
             continue
-        if in_string:
+        if in_str:
             continue
         if c == '{':
             depth += 1
         elif c == '}':
             depth -= 1
             if depth == 0:
-                return text[start_pos:i+1]
+                return text[pos:i + 1]
     return None
 
-def extract_filemanager_params(html_content):
-    """Extracts required tokens from the Moodle files page."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # --- Extract sesskey ---
-    sesskey_input = soup.find('input', {'name': 'sesskey'})
-    sesskey = sesskey_input.get('value') if sesskey_input else None
-    if not sesskey:
-        sesskey_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', html_content)
-        sesskey = sesskey_match.group(1) if sesskey_match else None
-    
-    # --- Extract filemanager init data from JavaScript ---
-    # Moodle embeds the filemanager config (with itemid, client_id, and existing files)
-    # in a Y.use / M.form_filemanager.init call in the page's JavaScript.
-    fm_init_data = None
-    
-    # Pattern 1: M.form_filemanager.init(Y, {...});
-    fm_match = re.search(r'M\.form_filemanager\.init\s*\(\s*Y\s*,\s*', html_content)
-    if fm_match:
-        json_str = extract_balanced_json(html_content, fm_match.end())
-        if json_str:
-            try:
-                fm_init_data = json.loads(json_str)
-                print(f"DEBUG: Found M.form_filemanager.init data with keys: {list(fm_init_data.keys())}")
-            except json.JSONDecodeError as e:
-                print(f"DEBUG: Failed to parse filemanager init JSON: {e}")
-                print(f"DEBUG: Raw JSON string (first 500 chars): {json_str[:500]}")
-    
-    # Pattern 2: initializer_for form_filemanager in require() call  
-    if not fm_init_data:
-        fm_match2 = re.search(r'"form_filemanager"\s*,\s*', html_content)
-        if fm_match2:
-            json_str2 = extract_balanced_json(html_content, fm_match2.end())
-            if json_str2:
+
+def _regex_first(html, *patterns):
+    """Try multiple regex patterns, return first match group(1) or None."""
+    for p in patterns:
+        m = re.search(p, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_page_params(html):
+    """Extract sesskey, draftitemid, client_id, file list, and hidden form fields.
+    Uses only regex — no BeautifulSoup needed."""
+
+    # sesskey
+    sesskey = _regex_first(html,
+        r'name="sesskey"\s+value="([^"]+)"',
+        r'"sesskey"\s*:\s*"([^"]+)"',
+    )
+
+    # filemanager init JSON (embedded in page JS)
+    fm = None
+    for pattern in [r'M\.form_filemanager\.init\s*\(\s*Y\s*,\s*', r'"form_filemanager"\s*,\s*']:
+        m = re.search(pattern, html)
+        if m:
+            raw = _extract_json_block(html, m.end())
+            if raw:
                 try:
-                    fm_init_data = json.loads(json_str2)
-                    print(f"DEBUG: Found form_filemanager data (pattern 2) with keys: {list(fm_init_data.keys())}")
+                    fm = json.loads(raw)
+                    break
                 except json.JSONDecodeError:
                     pass
-    
-    # Pattern 3: Look for any JSON block containing both "itemid" and "client_id" near "filemanager"
-    if not fm_init_data:
-        for fm_match3 in re.finditer(r'filemanager', html_content, re.IGNORECASE):
-            search_start = fm_match3.start()
-            brace_pos = html_content.find('{', search_start)
-            if brace_pos != -1 and brace_pos - search_start < 300:
-                json_str3 = extract_balanced_json(html_content, brace_pos)
-                if json_str3 and '"itemid"' in json_str3 and '"client_id"' in json_str3:
+
+    # Fallback: any JSON near "filemanager" with itemid + client_id
+    if not fm:
+        for m in re.finditer(r'filemanager', html, re.IGNORECASE):
+            brace = html.find('{', m.start())
+            if brace != -1 and brace - m.start() < 300:
+                raw = _extract_json_block(html, brace)
+                if raw and '"itemid"' in raw and '"client_id"' in raw:
                     try:
-                        fm_init_data = json.loads(json_str3)
-                        print(f"DEBUG: Found filemanager data (pattern 3) with keys: {list(fm_init_data.keys())}")
+                        fm = json.loads(raw)
                         break
                     except json.JSONDecodeError:
                         continue
-    
-    if not fm_init_data:
-        # Dump HTML context around 'filemanager' for debugging
-        fm_pos = html_content.lower().find('filemanager')
-        if fm_pos != -1:
-            start = max(0, fm_pos - 200)
-            end = min(len(html_content), fm_pos + 2000)
-            print(f"DEBUG: No filemanager init data found. HTML around 'filemanager' (pos {fm_pos}):")
-            print(html_content[start:end])
-        else:
-            print("DEBUG: 'filemanager' not found anywhere in the page HTML!")
-    
-    # --- Extract draftitemid ---
-    draftitemid = None
-    if fm_init_data:
-        draftitemid = str(fm_init_data.get('itemid', '')) or None
-        print(f"DEBUG: itemid from JS init data: {draftitemid}")
-    
-    if not draftitemid:
-        draft_input = soup.find('input', {'name': 'files_filemanager'})
-        if not draft_input:
-            draft_input = soup.find('input', id=re.compile(r'id_files_filemanager'))
-        draftitemid = draft_input.get('value') if draft_input else None
-        print(f"DEBUG: itemid from HTML input: {draftitemid}")
-    
-    if not draftitemid:
-        # Try broader regex patterns
-        itemid_match = re.search(r'"itemid"\s*:\s*(\d+)', html_content)
-        if not itemid_match:
-            itemid_match = re.search(r'itemid=(\d+)', html_content)
-        draftitemid = itemid_match.group(1) if itemid_match else None
-        print(f"DEBUG: itemid from regex fallback: {draftitemid}")
-    
-    # --- Extract client_id ---
-    client_id = None
-    if fm_init_data:
-        client_id = fm_init_data.get('client_id')
-        print(f"DEBUG: client_id from JS init data: {client_id}")
-    
+
+    # draftitemid
+    itemid = str(fm.get('itemid', '')) if fm else None
+    if not itemid:
+        itemid = _regex_first(html,
+            r'name="files_filemanager"\s+value="(\d+)"',
+            r'"itemid"\s*:\s*(\d+)',
+            r'itemid=(\d+)',
+        )
+
+    # client_id
+    client_id = fm.get('client_id') if fm else None
     if not client_id:
-        client_id_match = re.search(r'id="filemanager-([a-zA-Z0-9]+)"', html_content)
-        client_id = client_id_match.group(1) if client_id_match else None
-        if not client_id:
-            client_id_match = re.search(r'"client_id"\s*:\s*"([^"]+)"', html_content)
-            client_id = client_id_match.group(1) if client_id_match else None
-        print(f"DEBUG: client_id from HTML/regex: {client_id}")
-    
-    # --- Extract files already listed in the JS init data (fallback) ---
+        client_id = _regex_first(html,
+            r'id="filemanager-([a-zA-Z0-9]+)"',
+            r'"client_id"\s*:\s*"([^"]+)"',
+        )
+
+    # Files embedded in JS init data
     js_files = []
-    if fm_init_data and 'list' in fm_init_data:
-        js_files = fm_init_data['list']
-        # The list might be a dict (keyed by filename) or a list
+    if fm and 'list' in fm:
+        js_files = fm['list']
         if isinstance(js_files, dict):
             js_files = list(js_files.values())
-        print(f"DEBUG: Found {len(js_files)} files embedded in JS init data")
-        for jf in js_files:
-            print(f"  JS file: {jf.get('filename', 'unknown')}")
-    
-    return sesskey, draftitemid, client_id, soup, js_files
 
-def process_workflow():
-    processed_timestamps = {}
-    POLL_INTERVAL = 5  # Check every 5 seconds
-    
-    print(f"MoodAI Worker started.")
-    print(f"Target: {MOODLE_BASE_URL}")
-    print(f"Username: {USERNAME}")
-    print(f"Password set: {bool(PASSWORD)}")
-    print(f"API Key set: {bool(AI_API_KEY)}")
-    
-    # Create a persistent session — reused across cycles to avoid re-login spam
+    # Hidden form fields (for the save POST) — regex instead of BeautifulSoup
+    hidden = {}
+    for tag in re.finditer(r'<input[^>]+type=["\']hidden["\'][^>]*>', html):
+        nm = re.search(r'name=["\']([^"\']+)["\']', tag.group(0))
+        vl = re.search(r'value=["\']([^"\']*)["\']', tag.group(0))
+        if nm:
+            hidden[nm.group(1)] = vl.group(1) if vl else ''
+
+    return sesskey, itemid, client_id, js_files, hidden
+
+
+def moodle_login(session):
+    """Perform Moodle login. Returns the files page response or None."""
+    try:
+        page = session.get(LOGIN_URL, timeout=30)
+        token = _regex_first(page.text, r'name="logintoken" value="([^"]+)"')
+        if not token:
+            print("  No logintoken found")
+            return None
+
+        resp = session.post(LOGIN_URL, data={
+            'username': USERNAME, 'password': PASSWORD,
+            'logintoken': token, 'anchor': ''
+        }, timeout=30)
+
+        if 'loginerrors' in resp.text or 'Invalid login' in resp.text:
+            print("  ERROR: Invalid credentials!")
+            return None
+
+        files_resp = session.get(FILES_URL, timeout=30)
+        if 'name="logintoken"' in files_resp.text:
+            print("  Login failed — still on login page")
+            return None
+
+        user = _regex_first(files_resp.text, r'loggedinuser[^>]*>([^<]+)<')
+        if user:
+            print(f"  Logged in as: {user.strip()}")
+        return files_resp
+    except requests.exceptions.RequestException as e:
+        print(f"  Connection error: {e}")
+        return None
+
+
+# --- Main Loop ---
+def main():
+    processed = {}  # filename -> last datemodified we processed
+
     session = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=2,
+    adapter = HTTPAdapter(max_retries=Retry(
+        total=3, backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    ))
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    logged_in = False  # Track whether we've successfully authenticated
-    
+    logged_in = False
+
+    print(f"Polling {MOODLE_BASE_URL} every {POLL_INTERVAL}s as {USERNAME}")
+
     while True:
-      try:
-        print(f"Checking for files at {FILES_URL}...")
         try:
-            response = session.get(FILES_URL, timeout=30)
-        except requests.exceptions.RequestException as e:
-            print(f"ERROR: Could not connect to Moodle server: {e}")
-            time.sleep(POLL_INTERVAL)
-            continue
-        
-        # Moodle might return 303 Redirect or 200 OK with the login form
-        if "name=\"logintoken\"" in response.text or response.status_code == 303:
-            if logged_in:
-                print("Session expired. Re-authenticating...")
-            else:
-                print("Authentication required. Logging in...")
-            
+            # 1. Fetch files page (doubles as session check)
             try:
-                # Fetch the login page to get a fresh logintoken and session cookie
-                login_page = session.get(LOGIN_URL, timeout=30)
-                logintoken = get_login_token(login_page.text)
-                
-                if not logintoken:
-                    print("Could not find logintoken on the login page. Retrying in 60s...")
-                    time.sleep(POLL_INTERVAL)
-                    continue
+                resp = session.get(FILES_URL, timeout=30)
+            except requests.exceptions.RequestException as e:
+                print(f"Connection error: {e}")
+                time.sleep(POLL_INTERVAL)
+                continue
 
-                login_data = {
-                    'username': USERNAME,
-                    'password': PASSWORD,
-                    'logintoken': logintoken,
-                    'anchor': ''
-                }
-                
-                # Submit the login form
-                login_response = session.post(LOGIN_URL, data=login_data, timeout=30)
-                print(f"Login POST status: {login_response.status_code}")
-                print(f"Login POST redirected to: {login_response.url}")
-                
-                # Check for error messages in the login response
-                if 'loginerrors' in login_response.text or 'Invalid login' in login_response.text:
-                    print("ERROR: Moodle returned login error - invalid credentials!")
+            # 2. Login only if Moodle shows login form
+            if 'name="logintoken"' in resp.text or resp.status_code == 303:
+                print("Session expired, re-authenticating..." if logged_in else "Logging in...")
+                resp = moodle_login(session)
+                if not resp:
                     logged_in = False
                     time.sleep(POLL_INTERVAL)
                     continue
-                
-                # Verify login by attempting to fetch the files page again
-                response = session.get(FILES_URL, timeout=30)
-                print(f"Files page status after login: {response.status_code}")
-                
-                # Try to extract logged-in username from page
-                logged_in_match = re.search(r'loggedinuser.*?>(.+?)<', response.text)
-                if logged_in_match:
-                    print(f"Logged in as: {logged_in_match.group(1).strip()}")
-                
-                if "name=\"logintoken\"" in response.text:
-                    print("Login failed. Still seeing login form after POST.")
-                    print("Check that MOODLE_USERNAME and MOODLE_PASSWORD secrets are correct.")
-                    logged_in = False
-                    time.sleep(current_sleep)
-                    continue
-                
                 logged_in = True
-            except requests.exceptions.RequestException as e:
-                print(f"ERROR: Connection error during login: {e}")
-                print(f"Retrying in {POLL_INTERVAL} seconds...")
-                logged_in = False
-                time.sleep(POLL_INTERVAL)
-                continue
-        else:
-            if not logged_in:
+            elif not logged_in:
                 logged_in = True
-                print("Session is active (already authenticated).")
-            # Session still valid — no login needed, just proceed with the refreshed page
 
-        # If we successfully accessed the files page
-        if response.status_code == 200 and "name=\"logintoken\"" not in response.text:
-            sesskey, draftitemid, client_id, soup, js_files = extract_filemanager_params(response.text)
-            
-            print(f"DEBUG: Extracted params -> sesskey={sesskey}, draftitemid={draftitemid}, client_id={client_id}")
-            
-            if not all([sesskey, draftitemid, client_id]):
-                print(f"Failed to extract parameters: sesskey={sesskey}, draftitemid={draftitemid}, client_id={client_id}")
+            # 3. Extract page parameters
+            sesskey, itemid, client_id, js_files, hidden = extract_page_params(resp.text)
+            if not all([sesskey, itemid, client_id]):
+                print(f"Missing params: sesskey={sesskey}, itemid={itemid}, client_id={client_id}")
                 time.sleep(POLL_INTERVAL)
                 continue
-                
-            # List files in draft area
-            list_url = f"{MOODLE_BASE_URL}/repository/draftfiles_ajax.php?action=list"
-            list_data = {
-                'sesskey': sesskey,
-                'client_id': client_id,
-                'filepath': '/',
-                'itemid': draftitemid
-            }
-            
+
+            # 4. List files via AJAX
             try:
-                list_response = session.post(list_url, data=list_data, timeout=30)
-            except requests.exceptions.RequestException as e:
-                print(f"ERROR: Draft files AJAX request failed: {e}")
-                time.sleep(POLL_INTERVAL)
-                continue
-            print(f"DEBUG: Draft files AJAX status: {list_response.status_code}")
-            print(f"DEBUG: Draft files AJAX response (first 1000 chars): {list_response.text[:1000]}")
-            try:
-                files_list = list_response.json()
-            except Exception as e:
-                print(f"Error decoding draft files list: {e}")
-                time.sleep(POLL_INTERVAL)
-                continue
-                
-            files_to_process = []
-            all_files = files_list.get('list', [])
-            
-            # If AJAX returned no files but we got files from the JS init data, use those
+                ajax = session.post(
+                    f"{MOODLE_BASE_URL}/repository/draftfiles_ajax.php?action=list",
+                    data={'sesskey': sesskey, 'client_id': client_id, 'filepath': '/', 'itemid': itemid},
+                    timeout=30,
+                )
+                all_files = ajax.json().get('list', [])
+            except Exception:
+                all_files = []
+
             if not all_files and js_files:
-                print(f"AJAX returned 0 files but JS init data has {len(js_files)} files. Using JS data.")
                 all_files = js_files
-            
-            print(f"Total files in Moodle private files: {len(all_files)}")
-            for f_info in all_files:
-                filename = f_info.get('filename', '')
-                print(f"  Found: {filename} (modified: {f_info.get('datemodified', 'N/A')})")
-                # Process any .txt file that is NOT an answer file
-                if filename.endswith('.txt') and not filename.startswith('answers_') and filename != 'answers.txt':
-                    questions_datemodified = f_info.get('datemodified', 0)
-                    last_processed = processed_timestamps.get(filename, 0)
-                    if questions_datemodified > last_processed:
-                        files_to_process.append(f_info)
-                        
-            if not files_to_process:
-                print(f"No new or updated .txt question files found. Waiting {POLL_INTERVAL}s...")
+
+            # 5. Filter for new/updated question files
+            new_files = [
+                f for f in all_files
+                if f.get('filename', '').endswith('.txt')
+                and not f.get('filename', '').startswith('answers_')
+                and f.get('filename') != 'answers.txt'
+                and f.get('datemodified', 0) > processed.get(f.get('filename', ''), 0)
+            ]
+
+            if not new_files:
                 time.sleep(POLL_INTERVAL)
                 continue
-                
-            uploads_successful = 0
-            
-            for f_info in files_to_process:
-                filename = f_info['filename']
-                questions_url = f_info['url']
-                questions_datemodified = f_info['datemodified']
-                
-                print(f"Downloading {filename} from {questions_url}...")
+
+            # 6. Process each question file
+            print(f"Found {len(new_files)} new question file(s)")
+            uploads = 0
+
+            for f in new_files:
+                name = f['filename']
+                modified = f['datemodified']
+
+                # Download
                 try:
-                    file_response = session.get(questions_url, timeout=30)
+                    dl = session.get(f['url'], timeout=30)
+                    if dl.status_code != 200:
+                        print(f"  {name}: download failed ({dl.status_code})")
+                        continue
                 except requests.exceptions.RequestException as e:
-                    print(f"ERROR: Failed to download {filename}: {e}")
+                    print(f"  {name}: download error: {e}")
                     continue
-                
-                if file_response.status_code == 200:
-                    print(f"File {filename} downloaded successfully!")
-                    questions = file_response.text
-                    print(f"Questions:\n{questions}\n")
-                    
-                    print(f"Querying AI for {filename}...")
-                    try:
-                        # Call AI with automatic Gemini -> Groq fallback
-                        answers, provider = call_ai(questions)
-                        print(f"Answers generated successfully via {provider}.")
-                        
-                        if filename == 'questions.txt':
-                            answers_filename = 'answers.txt'
-                        else:
-                            answers_filename = f"answers_{filename}"
-                            
-                        with open(answers_filename, "w", encoding="utf-8") as f:
-                            f.write(answers)
-                            
-                        print(f"Saved to {answers_filename}.")
-                        
-                        # --- UPLOAD PHASE ---
-                        print(f"Uploading {answers_filename} to Moodle via Web Scraping...")
-                        
-                        # Based on the user's network trace, the "Upload a file" repository ID is 4 on this server
-                        repo_id = "4"
-                        
-                        # 3. Upload File to Draft Area
-                        upload_url = f"{MOODLE_BASE_URL}/repository/repository_ajax.php?action=upload"
-                        upload_data = {
-                            'title': answers_filename,
-                            'author': USERNAME,
-                            'itemid': draftitemid,
-                            'repo_id': repo_id,
-                            'env': 'filemanager',
-                            'sesskey': sesskey,
-                            'client_id': client_id,
-                            'savepath': '/'
-                        }
-                        with open(answers_filename, 'rb') as f:
-                            files = {'repo_upload_file': f} # Moodle expects this field name
-                            
-                            try:
-                                upload_res = session.post(upload_url, data=upload_data, files=files, timeout=60).json()
-                            except requests.exceptions.RequestException as e:
-                                print(f"ERROR: Upload request failed for {answers_filename}: {e}")
-                                upload_res = {'error': True}
-                            except Exception as e:
-                                print(f"JSON Decode Error (Upload response might not be JSON): {e}")
-                                upload_res = {'error': True}
-                            
-                        if 'error' in upload_res:
-                            print(f"Failed to upload {answers_filename} to draft area: {upload_res}")
-                        else:
-                            print(f"File {answers_filename} successfully uploaded to draft area.")
-                            uploads_successful += 1
-                            # Update timestamp logic here so we don't process it again if it succeeded
-                            processed_timestamps[filename] = questions_datemodified
-                            
-                    except Exception as e:
-                        print(f"An error occurred while processing {filename} (AI or Upload): {e}")
-                else:
-                    print(f"Failed to download {filename}. Status Code: {file_response.status_code}")
-                    
-            # 4. Save Draft Area to Private Files if we uploaded anything
-            if uploads_successful > 0:
-                print(f"Saving {uploads_successful} new file(s) to private files...")
-                save_data = {}
-                mform = soup.find('form', {'class': 'mform'})
-                if mform:
-                    for hidden in mform.find_all('input', type='hidden'):
-                        name = hidden.get('name')
-                        value = hidden.get('value', '')
-                        if name:
-                            save_data[name] = value
-                
-                save_data['sesskey'] = sesskey
-                save_data['files_filemanager'] = draftitemid
-                save_data['submitbutton'] = 'Save changes'
-                
+
+                questions = dl.text
+                print(f"  {name}: {len(questions)} chars")
+
+                # Get AI answer
                 try:
-                    save_res = session.post(FILES_URL, data=save_data, timeout=30)
-                    
-                    if save_res.status_code == 200:
-                        print("Upload complete. Saved all new files to private files.")
-                    else:
-                        print(f"Failed to save to private files. Status: {save_res.status_code}")
+                    answers, model = call_ai(questions)
+                    print(f"  {name}: answered via {model}")
+                except Exception as e:
+                    print(f"  {name}: AI failed: {e}")
+                    continue
+
+                # Upload directly from memory (no disk I/O)
+                ans_name = 'answers.txt' if name == 'questions.txt' else f"answers_{name}"
+                try:
+                    upload = session.post(
+                        f"{MOODLE_BASE_URL}/repository/repository_ajax.php?action=upload",
+                        data={
+                            'title': ans_name, 'author': USERNAME,
+                            'itemid': itemid, 'repo_id': '4',
+                            'env': 'filemanager', 'sesskey': sesskey,
+                            'client_id': client_id, 'savepath': '/',
+                        },
+                        files={'repo_upload_file': (ans_name, io.BytesIO(answers.encode('utf-8')), 'text/plain')},
+                        timeout=60,
+                    ).json()
+                except Exception as e:
+                    print(f"  {ans_name}: upload failed: {e}")
+                    continue
+
+                if 'error' in upload:
+                    print(f"  {ans_name}: upload error: {upload}")
+                else:
+                    print(f"  {ans_name}: uploaded OK")
+                    uploads += 1
+                    processed[name] = modified
+
+            # 7. Save draft area to private files
+            if uploads > 0:
+                save_data = dict(hidden)
+                save_data.update({
+                    'sesskey': sesskey,
+                    'files_filemanager': itemid,
+                    'submitbutton': 'Save changes',
+                })
+                try:
+                    save = session.post(FILES_URL, data=save_data, timeout=30)
+                    status = "OK" if save.status_code == 200 else f"failed ({save.status_code})"
+                    print(f"Saved {uploads} file(s) to private files: {status}")
                 except requests.exceptions.RequestException as e:
-                    print(f"ERROR: Failed to save to private files: {e}")
+                    print(f"Save error: {e}")
 
-            print(f"Waiting {POLL_INTERVAL}s before next cycle...")
-            time.sleep(POLL_INTERVAL)
-        else:
-            print(f"Unexpected status or content on files page. Status Code: {response.status_code}")
-            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            print(f"CRITICAL: {e}")
+            traceback.print_exc()
 
-      except Exception as e:
-        # Top-level safety net: catch ANY unexpected error so the worker never dies
-        print(f"CRITICAL: Unexpected error in main loop: {e}")
-        traceback.print_exc()
-        print(f"Recovering... waiting {POLL_INTERVAL}s before next cycle.")
         time.sleep(POLL_INTERVAL)
 
+
 if __name__ == "__main__":
-    # Session is persistent — login only happens when Moodle session expires
-    process_workflow()
+    main()

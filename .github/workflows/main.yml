@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-genai groq
+          pip install requests google-genai groq
           
       - name: Run MoodAI worker
         env:
