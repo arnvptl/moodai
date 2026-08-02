@@ -288,7 +288,7 @@ def extract_filemanager_params(html_content):
 
 def process_workflow():
     processed_timestamps = {}
-    current_sleep = 30  # Start by checking every 30 seconds
+    POLL_INTERVAL = 5  # Check every 5 seconds
     
     print(f"MoodAI Worker started.")
     print(f"Target: {MOODLE_BASE_URL}")
@@ -296,31 +296,35 @@ def process_workflow():
     print(f"Password set: {bool(PASSWORD)}")
     print(f"API Key set: {bool(AI_API_KEY)}")
     
+    # Create a persistent session — reused across cycles to avoid re-login spam
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    logged_in = False  # Track whether we've successfully authenticated
+    
     while True:
       try:
-        # Recreate session to force Moodle to generate a new draft area with updated files
-        session = requests.Session()
-        # Add retry logic for transient connection errors
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=2,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
         print(f"Checking for files at {FILES_URL}...")
         try:
             response = session.get(FILES_URL, timeout=30)
         except requests.exceptions.RequestException as e:
             print(f"ERROR: Could not connect to Moodle server: {e}")
-            time.sleep(current_sleep)
+            time.sleep(POLL_INTERVAL)
             continue
         
         # Moodle might return 303 Redirect or 200 OK with the login form
         if "name=\"logintoken\"" in response.text or response.status_code == 303:
-            print("Authentication required. Logging in...")
+            if logged_in:
+                print("Session expired. Re-authenticating...")
+            else:
+                print("Authentication required. Logging in...")
             
             try:
                 # Fetch the login page to get a fresh logintoken and session cookie
@@ -329,7 +333,7 @@ def process_workflow():
                 
                 if not logintoken:
                     print("Could not find logintoken on the login page. Retrying in 60s...")
-                    time.sleep(60)
+                    time.sleep(POLL_INTERVAL)
                     continue
 
                 login_data = {
@@ -347,7 +351,8 @@ def process_workflow():
                 # Check for error messages in the login response
                 if 'loginerrors' in login_response.text or 'Invalid login' in login_response.text:
                     print("ERROR: Moodle returned login error - invalid credentials!")
-                    time.sleep(current_sleep)
+                    logged_in = False
+                    time.sleep(POLL_INTERVAL)
                     continue
                 
                 # Verify login by attempting to fetch the files page again
@@ -362,13 +367,22 @@ def process_workflow():
                 if "name=\"logintoken\"" in response.text:
                     print("Login failed. Still seeing login form after POST.")
                     print("Check that MOODLE_USERNAME and MOODLE_PASSWORD secrets are correct.")
+                    logged_in = False
                     time.sleep(current_sleep)
                     continue
+                
+                logged_in = True
             except requests.exceptions.RequestException as e:
                 print(f"ERROR: Connection error during login: {e}")
-                print(f"Retrying in {current_sleep} seconds...")
-                time.sleep(current_sleep)
+                print(f"Retrying in {POLL_INTERVAL} seconds...")
+                logged_in = False
+                time.sleep(POLL_INTERVAL)
                 continue
+        else:
+            if not logged_in:
+                logged_in = True
+                print("Session is active (already authenticated).")
+            # Session still valid — no login needed, just proceed with the refreshed page
 
         # If we successfully accessed the files page
         if response.status_code == 200 and "name=\"logintoken\"" not in response.text:
@@ -378,7 +392,7 @@ def process_workflow():
             
             if not all([sesskey, draftitemid, client_id]):
                 print(f"Failed to extract parameters: sesskey={sesskey}, draftitemid={draftitemid}, client_id={client_id}")
-                time.sleep(current_sleep)
+                time.sleep(POLL_INTERVAL)
                 continue
                 
             # List files in draft area
@@ -394,7 +408,7 @@ def process_workflow():
                 list_response = session.post(list_url, data=list_data, timeout=30)
             except requests.exceptions.RequestException as e:
                 print(f"ERROR: Draft files AJAX request failed: {e}")
-                time.sleep(current_sleep)
+                time.sleep(POLL_INTERVAL)
                 continue
             print(f"DEBUG: Draft files AJAX status: {list_response.status_code}")
             print(f"DEBUG: Draft files AJAX response (first 1000 chars): {list_response.text[:1000]}")
@@ -402,7 +416,7 @@ def process_workflow():
                 files_list = list_response.json()
             except Exception as e:
                 print(f"Error decoding draft files list: {e}")
-                time.sleep(current_sleep)
+                time.sleep(POLL_INTERVAL)
                 continue
                 
             files_to_process = []
@@ -425,8 +439,8 @@ def process_workflow():
                         files_to_process.append(f_info)
                         
             if not files_to_process:
-                print(f"No new or updated .txt question files found. Waiting {current_sleep} seconds...")
-                time.sleep(current_sleep)
+                print(f"No new or updated .txt question files found. Waiting {POLL_INTERVAL}s...")
+                time.sleep(POLL_INTERVAL)
                 continue
                 
             uploads_successful = 0
@@ -528,27 +542,24 @@ def process_workflow():
                     
                     if save_res.status_code == 200:
                         print("Upload complete. Saved all new files to private files.")
-                        # SUCCESSFUL UPLOAD: Change polling interval to 15 minutes!
-                        current_sleep = 900
-                        print("Switching to 15-minute polling interval...")
                     else:
                         print(f"Failed to save to private files. Status: {save_res.status_code}")
                 except requests.exceptions.RequestException as e:
                     print(f"ERROR: Failed to save to private files: {e}")
 
-            print(f"Waiting {current_sleep} seconds before next cycle...")
-            time.sleep(current_sleep)
+            print(f"Waiting {POLL_INTERVAL}s before next cycle...")
+            time.sleep(POLL_INTERVAL)
         else:
             print(f"Unexpected status or content on files page. Status Code: {response.status_code}")
-            time.sleep(current_sleep)
+            time.sleep(POLL_INTERVAL)
 
       except Exception as e:
         # Top-level safety net: catch ANY unexpected error so the worker never dies
         print(f"CRITICAL: Unexpected error in main loop: {e}")
         traceback.print_exc()
-        print(f"Recovering... waiting {current_sleep} seconds before next cycle.")
-        time.sleep(current_sleep)
+        print(f"Recovering... waiting {POLL_INTERVAL}s before next cycle.")
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    # Session is recreated per cycle to avoid sticky draft areas
+    # Session is persistent — login only happens when Moodle session expires
     process_workflow()
