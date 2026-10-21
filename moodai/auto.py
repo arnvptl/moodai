@@ -5,6 +5,7 @@ from urllib3.util.retry import Retry
 import re
 import os
 import io
+import zipfile
 import traceback
 from google import genai
 import json
@@ -50,10 +51,10 @@ if OPENROUTER_API_KEY:
 FALLBACK_CHAIN = [
     ("gemini",     "gemini-3.8-flash"),
     ("openrouter", "poolside/laguna-s-2.1:free"),
-    ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
     ("groq",       "openai/gpt-oss-120b"),
     ("groq",       "qwen/qwen3.8-27b"),
-    ("openrouter", "google/gemma-4-31b-it:free"),
+    ("openrouter", "google/gemma-4-26b-a4b-it:free"),
     ("gemini",     "gemini-3.6-flash"),
     ("openrouter", "cohere/north-mini-code:free"),
     ("groq",       "openai/gpt-oss-20b"),
@@ -72,12 +73,41 @@ SYSTEM_PROMPT = (
     "If the question is not about Java, just answer it normally in a simple and direct way."
 )
 
+PROJECT_SYSTEM_PROMPT = (
+    "You are a college student creating a Java project for a NetBeans IDE assignment. "
+    "Generate ALL the Java source files needed for a complete, working project. "
+    "Write code like a beginner — simple variable names, basic loops, straightforward logic. "
+    "Always include all necessary import statements. "
+    "For GUI programs, use javax.swing and java.awt. "
+    "For JDBC programs, use java.sql.* with DriverManager, Connection, PreparedStatement, ResultSet. "
+    "For Spring programs, include proper annotations (@SpringBootApplication, @RestController, etc.). "
+    "\n\n"
+    "CRITICAL OUTPUT FORMAT RULES:\n"
+    "1. Output ONLY Java source files, nothing else.\n"
+    "2. For EACH file, use this EXACT format:\n"
+    "===FILE:packagename/ClassName.java===\n"
+    "package packagename;\n\n"
+    "import ...;\n\n"
+    "public class ClassName {\n"
+    "    // code here\n"
+    "}\n"
+    "===END_FILE===\n\n"
+    "3. The path after FILE: must be the package directory + filename (e.g. myapp/Main.java).\n"
+    "4. If no package is needed, just use the filename (e.g. Main.java).\n"
+    "5. Every class MUST have its own file.\n"
+    "6. One file MUST contain a public static void main(String[] args) method.\n"
+    "7. Do NOT include any explanation text outside the file blocks.\n"
+    "8. Do NOT use markdown code fences (```).\n"
+)
+
 print(f"MoodAI | {len(FALLBACK_CHAIN)} models | Groq: {'on' if groq_client else 'off'} | OpenRouter: {'on' if openrouter_client else 'off'}")
 
 
 # --- AI Call with Fallback ---
-def call_ai(prompt):
+def call_ai(prompt, system_prompt=None):
     """Try each model in order. Returns (answer, model_name) or raises."""
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
     errors = []
     for provider, model in FALLBACK_CHAIN:
         if provider == "gemini":
@@ -95,7 +125,7 @@ def call_ai(prompt):
                 resp = client.models.generate_content(
                     model=model, contents=prompt,
                     config=genai.types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT, temperature=0.2,
+                        system_instruction=system_prompt, temperature=0.2,
                     ),
                 )
                 answer = resp.text
@@ -103,7 +133,7 @@ def call_ai(prompt):
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
@@ -116,6 +146,165 @@ def call_ai(prompt):
         except Exception as e:
             errors.append(f"{provider}/{model}: {e}")
     raise Exception(f"All models failed: {'; '.join(errors[-3:])}")
+
+
+# --- Project Generation Helpers ---
+def parse_project_files(ai_response):
+    """Parse AI response into a dict of {filepath: content}.
+    Expects ===FILE:path=== ... ===END_FILE=== blocks."""
+    files = {}
+    # Match blocks between ===FILE:...=== and ===END_FILE===
+    pattern = r'===FILE:(.+?)===\s*\n(.*?)===END_FILE==='
+    matches = re.findall(pattern, ai_response, re.DOTALL)
+
+    if not matches:
+        # Fallback: try to extract from markdown code blocks with filenames
+        md_pattern = r'```(?:java)?\s*\n// (?:File: )?(.+?\.java)\s*\n(.*?)```'
+        matches = re.findall(md_pattern, ai_response, re.DOTALL)
+
+    if not matches:
+        # Last resort: treat entire response as a single Main.java
+        clean = ai_response.strip()
+        # Strip markdown fences if present
+        clean = re.sub(r'^```\w*\n', '', clean)
+        clean = re.sub(r'\n```$', '', clean)
+        # Try to extract package name
+        pkg_match = re.search(r'^package\s+([\w.]+)\s*;', clean, re.MULTILINE)
+        if pkg_match:
+            pkg_path = pkg_match.group(1).replace('.', '/')
+            # Try to extract class name
+            cls_match = re.search(r'public\s+class\s+(\w+)', clean)
+            cls_name = cls_match.group(1) if cls_match else 'Main'
+            files[f"{pkg_path}/{cls_name}.java"] = clean
+        else:
+            cls_match = re.search(r'public\s+class\s+(\w+)', clean)
+            cls_name = cls_match.group(1) if cls_match else 'Main'
+            files[f"{cls_name}.java"] = clean
+        return files
+
+    for filepath, content in matches:
+        filepath = filepath.strip().strip('/')
+        content = content.strip()
+        files[filepath] = content
+
+    return files
+
+
+def find_main_class(files):
+    """Find the fully qualified main class from parsed files."""
+    for filepath, content in files.items():
+        if 'public static void main' in content:
+            # Extract package
+            pkg_match = re.search(r'^package\s+([\w.]+)\s*;', content, re.MULTILINE)
+            # Extract class name
+            cls_match = re.search(r'public\s+class\s+(\w+)', content)
+            if cls_match:
+                cls_name = cls_match.group(1)
+                if pkg_match:
+                    return f"{pkg_match.group(1)}.{cls_name}"
+                return cls_name
+    return "Main"
+
+
+def build_netbeans_zip(project_name, files):
+    """Build a complete NetBeans Ant project as an in-memory zip.
+    Returns a BytesIO containing the zip."""
+    main_class = find_main_class(files)
+
+    # --- NetBeans project scaffolding ---
+    project_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://www.netbeans.org/ns/project/1">
+    <type>org.netbeans.modules.java.j2seproject</type>
+    <configuration>
+        <data xmlns="http://www.netbeans.org/ns/j2se-project/3">
+            <name>{project_name}</name>
+            <source-roots>
+                <root id="src.dir"/>
+            </source-roots>
+            <test-roots>
+                <root id="test.src.dir"/>
+            </test-roots>
+        </data>
+    </configuration>
+</project>"""
+
+    project_properties = f"""annotation.processing.enabled=true
+annotation.processing.enabled.in.editor=false
+annotation.processing.processors.list=
+annotation.processing.run.all.processors=true
+annotation.processing.source.output=${{build.generated.sources.dir}}/ap-source-output
+build.classes.dir=${{build.dir}}/classes
+build.classes.excludes=**/*.java,**/*.form
+build.dir=build
+build.generated.dir=${{build.dir}}/generated
+build.generated.sources.dir=${{build.dir}}/generated-sources
+build.sysclasspath=ignore
+build.test.classes.dir=${{build.dir}}/test/classes
+build.test.results.dir=${{build.dir}}/test/results
+debug.classpath=${{run.classpath}}
+debug.test.classpath=${{run.test.classpath}}
+dist.dir=dist
+dist.jar=${{dist.dir}}/{project_name}.jar
+dist.javadoc.dir=${{dist.dir}}/javadoc
+jar.compress=false
+javac.classpath=
+javac.compilerargs=
+javac.deprecation=false
+javac.external.vm=true
+javac.processorpath=${{javac.classpath}}
+javac.source=17
+javac.target=17
+javac.test.classpath=${{javac.classpath}}:${{build.classes.dir}}
+javac.test.processorpath=${{javac.test.classpath}}
+javadoc.additionalparam=
+javadoc.author=false
+javadoc.encoding=${{source.encoding}}
+javadoc.noindex=false
+javadoc.nonavbar=false
+javadoc.notree=false
+javadoc.private=false
+javadoc.splitindex=true
+javadoc.use=true
+javadoc.version=false
+javadoc.windowtitle=
+main.class={main_class}
+manifest.file=manifest.mf
+meta.inf.dir=${{src.dir}}/META-INF
+mkdist.disabled=false
+platform.active=default_platform
+run.classpath=${{javac.classpath}}:${{build.classes.dir}}
+run.jvmargs=
+run.test.classpath=${{javac.test.classpath}}:${{build.test.classes.dir}}
+source.encoding=UTF-8
+src.dir=src
+test.src.dir=test
+"""
+
+    build_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<project name="{project_name}" default="default" basedir=".">
+    <description>Builds, tests, and runs the project {project_name}.</description>
+    <import file="nbproject/build-impl.xml"/>
+</project>"""
+
+    manifest_mf = "Manifest-Version: 1.0\nX-COMMENT: Main-Class will be added automatically by build\n\n"
+
+    # --- Build the zip in memory ---
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        prefix = project_name
+
+        # NetBeans metadata
+        zf.writestr(f"{prefix}/nbproject/project.xml", project_xml)
+        zf.writestr(f"{prefix}/nbproject/project.properties", project_properties)
+        zf.writestr(f"{prefix}/build.xml", build_xml)
+        zf.writestr(f"{prefix}/manifest.mf", manifest_mf)
+
+        # Source files
+        for filepath, content in files.items():
+            zf.writestr(f"{prefix}/src/{filepath}", content)
+
+    buf.seek(0)
+    return buf
 
 
 # --- Moodle Helpers ---
@@ -260,6 +449,32 @@ def moodle_login(session):
         return None
 
 
+def upload_file(session, filename, filedata, mimetype, sesskey, itemid, client_id):
+    """Upload a file to Moodle draft area. Returns True on success."""
+    try:
+        upload = session.post(
+            f"{MOODLE_BASE_URL}/repository/repository_ajax.php?action=upload",
+            data={
+                'title': filename, 'author': USERNAME,
+                'itemid': itemid, 'repo_id': '4',
+                'env': 'filemanager', 'sesskey': sesskey,
+                'client_id': client_id, 'savepath': '/',
+            },
+            files={'repo_upload_file': (filename, filedata, mimetype)},
+            timeout=60,
+        ).json()
+    except Exception as e:
+        print(f"  {filename}: upload failed: {e}")
+        return False
+
+    if 'error' in upload:
+        print(f"  {filename}: upload error: {upload}")
+        return False
+
+    print(f"  {filename}: uploaded OK")
+    return True
+
+
 # --- Main Loop ---
 def main():
     processed = {}  # filename -> last datemodified we processed
@@ -353,7 +568,44 @@ def main():
                 questions = dl.text
                 print(f"  {name}: {len(questions)} chars")
 
-                # Get AI answer
+                # --- PROJECT MODE: project_*.txt → NetBeans zip ---
+                if name.startswith('project_'):
+                    print(f"  {name}: PROJECT MODE — generating NetBeans project...")
+                    try:
+                        ai_response, model = call_ai(questions, system_prompt=PROJECT_SYSTEM_PROMPT)
+                        print(f"  {name}: project code generated via {model}")
+                    except Exception as e:
+                        print(f"  {name}: AI failed: {e}")
+                        continue
+
+                    # Parse AI output into files
+                    project_files = parse_project_files(ai_response)
+                    if not project_files:
+                        print(f"  {name}: ERROR — AI returned no parseable files, falling back to text answer")
+                        # Fall through to normal text answer below
+                    else:
+                        # Derive project name from filename: project_calculator.txt → Calculator
+                        base = name.replace('project_', '').replace('.txt', '')
+                        project_name = base.title().replace(' ', '').replace('_', '')
+                        if not project_name:
+                            project_name = "JavaProject"
+
+                        print(f"  {name}: building NetBeans project '{project_name}' with {len(project_files)} source file(s):")
+                        for fp in project_files:
+                            print(f"    src/{fp}")
+
+                        # Build zip
+                        zip_buf = build_netbeans_zip(project_name, project_files)
+                        zip_name = f"{project_name}.zip"
+
+                        # Upload zip
+                        if upload_file(session, zip_name, zip_buf, 'application/zip',
+                                       sesskey, itemid, client_id):
+                            uploads += 1
+                            processed[name] = modified
+                        continue
+
+                # --- NORMAL MODE: regular .txt → text answer ---
                 try:
                     answers, model = call_ai(questions)
                     print(f"  {name}: answered via {model}")
@@ -361,28 +613,10 @@ def main():
                     print(f"  {name}: AI failed: {e}")
                     continue
 
-                # Upload directly from memory (no disk I/O)
+                # Upload text answer
                 ans_name = 'answers.txt' if name == 'questions.txt' else f"answers_{name}"
-                try:
-                    upload = session.post(
-                        f"{MOODLE_BASE_URL}/repository/repository_ajax.php?action=upload",
-                        data={
-                            'title': ans_name, 'author': USERNAME,
-                            'itemid': itemid, 'repo_id': '4',
-                            'env': 'filemanager', 'sesskey': sesskey,
-                            'client_id': client_id, 'savepath': '/',
-                        },
-                        files={'repo_upload_file': (ans_name, io.BytesIO(answers.encode('utf-8')), 'text/plain')},
-                        timeout=60,
-                    ).json()
-                except Exception as e:
-                    print(f"  {ans_name}: upload failed: {e}")
-                    continue
-
-                if 'error' in upload:
-                    print(f"  {ans_name}: upload error: {upload}")
-                else:
-                    print(f"  {ans_name}: uploaded OK")
+                if upload_file(session, ans_name, io.BytesIO(answers.encode('utf-8')),
+                               'text/plain', sesskey, itemid, client_id):
                     uploads += 1
                     processed[name] = modified
 
@@ -410,3 +644,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

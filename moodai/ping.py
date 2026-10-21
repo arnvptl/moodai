@@ -46,10 +46,10 @@ if OPENROUTER_API_KEY:
 FALLBACK_CHAIN = [
     ("gemini",     "gemini-3.8-flash"),
     ("openrouter", "poolside/laguna-s-2.1:free"),
-    ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("openrouter", "nvidia/nemotron-3.5-super-vl:free"),
     ("groq",       "openai/gpt-oss-120b"),
     ("groq",       "qwen/qwen3.8-27b"),
-    ("openrouter", "google/gemma-4-31b-it:free"),
+    ("openrouter", "google/gemma-4-26b-a4b-it:free"),
     ("gemini",     "gemini-3.6-flash"),
     ("openrouter", "cohere/north-mini-code:free"),
     ("groq",       "openai/gpt-oss-20b"),
