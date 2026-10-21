@@ -32,12 +32,12 @@ if GROQ_API_KEY:
 
 # ── Fallback chain (must mirror auto.py / legacy.py) ──────────────────────────
 FALLBACK_CHAIN = [
-    ("gemini", "gemini-4-argon"),
+    ("gemini", "gemini-3.8-flash"),
     ("groq",   "openai/gpt-oss-120b"),
-    ("gemini", "gemini-3.5-flash"),
-    ("groq",   "llama-3.3-70b-versatile"),
+    ("gemini", "gemini-2.5-pro"),
+    ("groq",   "qwen/qwen3.8-27b"),
+    ("gemini", "gemini-3.6-flash"),
     ("groq",   "openai/gpt-oss-20b"),
-    ("groq",   "llama-3.1-8b-instant"),
     ("gemini", "gemini-3.5-flash-lite"),
 ]
 
