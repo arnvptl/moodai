@@ -36,9 +36,9 @@ if GROQ_API_KEY:
         print(f"WARNING: Groq unavailable: {e}")
 
 FALLBACK_CHAIN = [
-    ("gemini", "gemini-3.5-flash"),
+    ("gemini", "gemini-4-argon"),
     ("groq",   "openai/gpt-oss-120b"),
-    ("groq",   "qwen/qwen3.6-27b"),
+    ("gemini", "gemini-3.5-flash"),
     ("groq",   "llama-3.3-70b-versatile"),
     ("groq",   "openai/gpt-oss-20b"),
     ("groq",   "llama-3.1-8b-instant"),
