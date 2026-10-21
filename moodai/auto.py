@@ -5,20 +5,28 @@ from urllib3.util.retry import Retry
 import re
 import os
 import io
-import zipfile
 import traceback
 from google import genai
 import json
+
+from project_agent import build_project
 
 # --- Configuration ---
 MOODLE_BASE_URL = "http://103.117.208.18/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
 POLL_INTERVAL = 5  # seconds between checks
+COOLDOWN_SECONDS = 60  # skip a model this long after it errors (rate limits etc.)
+RETRY_AFTER_FAIL = 120  # don't retry a failed question file for this long
 
 USERNAME = os.getenv("MOODLE_USERNAME")
 PASSWORD = os.getenv("MOODLE_PASSWORD")
 AI_API_KEY = os.getenv("AI_API_KEY")
+
+# MAX_RUNTIME_MIN unset -> run forever (local use); "0" -> one pass then exit;
+# "150" -> keep polling for 150 minutes then exit (GitHub Actions).
+_raw_runtime = os.getenv("MAX_RUNTIME_MIN")
+DEADLINE = float("inf") if _raw_runtime in (None, "") else time.time() + float(_raw_runtime) * 60
 
 if not USERNAME or not PASSWORD or not AI_API_KEY:
     print("Error: MOODLE_USERNAME, MOODLE_PASSWORD, and AI_API_KEY must be set.")
@@ -48,6 +56,7 @@ if OPENROUTER_API_KEY:
     except (ImportError, Exception) as e:
         print(f"WARNING: OpenRouter unavailable: {e}")
 
+# Put your strongest models first - planner / fixer / coder all start from the top.
 FALLBACK_CHAIN = [
     ("gemini",     "gemini-3.8-flash"),
     ("openrouter", "poolside/laguna-s-2.1:free"),
@@ -61,6 +70,14 @@ FALLBACK_CHAIN = [
     ("gemini",     "gemini-3.5-flash-lite"),
 ]
 
+# The reviewer starts from a different model than the coder, so it doesn't share its blind spots.
+ROLE_CHAINS = {
+    "planner":  FALLBACK_CHAIN,
+    "coder":    FALLBACK_CHAIN,
+    "fixer":    FALLBACK_CHAIN,
+    "reviewer": FALLBACK_CHAIN[1:] + FALLBACK_CHAIN[:1],
+}
+
 SYSTEM_PROMPT = (
     "You are a college student who is learning Java programming. "
     "Write code like a beginner - it doesn't have to be the cleanest or most optimized, "
@@ -73,238 +90,54 @@ SYSTEM_PROMPT = (
     "If the question is not about Java, just answer it normally in a simple and direct way."
 )
 
-PROJECT_SYSTEM_PROMPT = (
-    "You are a college student creating a Java project for a NetBeans IDE assignment. "
-    "Generate ALL the Java source files needed for a complete, working project. "
-    "Write code like a beginner — simple variable names, basic loops, straightforward logic. "
-    "Always include all necessary import statements. "
-    "For GUI programs, use javax.swing and java.awt. "
-    "For JDBC programs, use java.sql.* with DriverManager, Connection, PreparedStatement, ResultSet. "
-    "For Spring programs, include proper annotations (@SpringBootApplication, @RestController, etc.). "
-    "\n\n"
-    "CRITICAL OUTPUT FORMAT RULES:\n"
-    "1. Output ONLY Java source files, nothing else.\n"
-    "2. For EACH file, use this EXACT format:\n"
-    "===FILE:packagename/ClassName.java===\n"
-    "package packagename;\n\n"
-    "import ...;\n\n"
-    "public class ClassName {\n"
-    "    // code here\n"
-    "}\n"
-    "===END_FILE===\n\n"
-    "3. The path after FILE: must be the package directory + filename (e.g. myapp/Main.java).\n"
-    "4. If no package is needed, just use the filename (e.g. Main.java).\n"
-    "5. Every class MUST have its own file.\n"
-    "6. One file MUST contain a public static void main(String[] args) method.\n"
-    "7. Do NOT include any explanation text outside the file blocks.\n"
-    "8. Do NOT use markdown code fences (```).\n"
-)
-
 print(f"MoodAI | {len(FALLBACK_CHAIN)} models | Groq: {'on' if groq_client else 'off'} | OpenRouter: {'on' if openrouter_client else 'off'}")
+
+cooldown = {}  # (provider, model) -> time until which the model is skipped
 
 
 # --- AI Call with Fallback ---
-def call_ai(prompt, system_prompt=None):
-    """Try each model in order. Returns (answer, model_name) or raises."""
-    if system_prompt is None:
-        system_prompt = SYSTEM_PROMPT
-    errors = []
-    for provider, model in FALLBACK_CHAIN:
-        if provider == "gemini":
-            client = gemini_client
-        elif provider == "groq":
-            client = groq_client
-        elif provider == "openrouter":
-            client = openrouter_client
-        else:
-            continue
-        if client is None:
-            continue
-        try:
-            if provider == "gemini":
-                resp = client.models.generate_content(
-                    model=model, contents=prompt,
-                    config=genai.types.GenerateContentConfig(
-                        system_instruction=system_prompt, temperature=0.2,
-                    ),
-                )
-                answer = resp.text
-            else:  # groq and openrouter are both OpenAI-compatible
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                )
-                answer = resp.choices[0].message.content
+def _ask(provider, model, prompt, system):
+    client = {"gemini": gemini_client, "groq": groq_client, "openrouter": openrouter_client}.get(provider)
+    if client is None:
+        return None
+    if provider == "gemini":
+        resp = client.models.generate_content(
+            model=model, contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system, temperature=0.2,
+            ),
+        )
+        return resp.text
+    # groq and openrouter are both OpenAI-compatible
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
 
+
+def call_ai(prompt, system=SYSTEM_PROMPT, role="coder"):
+    """Try each model for this role in order. Returns (answer, model_name) or raises.
+    Models that errored recently are tried last instead of being skipped entirely."""
+    chain = ROLE_CHAINS.get(role, FALLBACK_CHAIN)
+    now = time.time()
+    ordered = [k for k in chain if cooldown.get(k, 0) <= now] + \
+              [k for k in chain if cooldown.get(k, 0) > now]
+    errors = []
+    for provider, model in ordered:
+        try:
+            answer = _ask(provider, model, prompt, system)
             if answer and answer.strip():
-                print(f"  AI: {provider}/{model} OK")
+                print(f"  AI[{role}]: {provider}/{model} OK")
                 return answer, f"{provider}/{model}"
         except Exception as e:
+            cooldown[(provider, model)] = time.time() + COOLDOWN_SECONDS
             errors.append(f"{provider}/{model}: {e}")
     raise Exception(f"All models failed: {'; '.join(errors[-3:])}")
-
-
-# --- Project Generation Helpers ---
-def parse_project_files(ai_response):
-    """Parse AI response into a dict of {filepath: content}.
-    Expects ===FILE:path=== ... ===END_FILE=== blocks."""
-    files = {}
-    # Match blocks between ===FILE:...=== and ===END_FILE===
-    pattern = r'===FILE:(.+?)===\s*\n(.*?)===END_FILE==='
-    matches = re.findall(pattern, ai_response, re.DOTALL)
-
-    if not matches:
-        # Fallback: try to extract from markdown code blocks with filenames
-        md_pattern = r'```(?:java)?\s*\n// (?:File: )?(.+?\.java)\s*\n(.*?)```'
-        matches = re.findall(md_pattern, ai_response, re.DOTALL)
-
-    if not matches:
-        # Last resort: treat entire response as a single Main.java
-        clean = ai_response.strip()
-        # Strip markdown fences if present
-        clean = re.sub(r'^```\w*\n', '', clean)
-        clean = re.sub(r'\n```$', '', clean)
-        # Try to extract package name
-        pkg_match = re.search(r'^package\s+([\w.]+)\s*;', clean, re.MULTILINE)
-        if pkg_match:
-            pkg_path = pkg_match.group(1).replace('.', '/')
-            # Try to extract class name
-            cls_match = re.search(r'public\s+class\s+(\w+)', clean)
-            cls_name = cls_match.group(1) if cls_match else 'Main'
-            files[f"{pkg_path}/{cls_name}.java"] = clean
-        else:
-            cls_match = re.search(r'public\s+class\s+(\w+)', clean)
-            cls_name = cls_match.group(1) if cls_match else 'Main'
-            files[f"{cls_name}.java"] = clean
-        return files
-
-    for filepath, content in matches:
-        filepath = filepath.strip().strip('/')
-        content = content.strip()
-        files[filepath] = content
-
-    return files
-
-
-def find_main_class(files):
-    """Find the fully qualified main class from parsed files."""
-    for filepath, content in files.items():
-        if 'public static void main' in content:
-            # Extract package
-            pkg_match = re.search(r'^package\s+([\w.]+)\s*;', content, re.MULTILINE)
-            # Extract class name
-            cls_match = re.search(r'public\s+class\s+(\w+)', content)
-            if cls_match:
-                cls_name = cls_match.group(1)
-                if pkg_match:
-                    return f"{pkg_match.group(1)}.{cls_name}"
-                return cls_name
-    return "Main"
-
-
-def build_netbeans_zip(project_name, files):
-    """Build a complete NetBeans Ant project as an in-memory zip.
-    Returns a BytesIO containing the zip."""
-    main_class = find_main_class(files)
-
-    # --- NetBeans project scaffolding ---
-    project_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://www.netbeans.org/ns/project/1">
-    <type>org.netbeans.modules.java.j2seproject</type>
-    <configuration>
-        <data xmlns="http://www.netbeans.org/ns/j2se-project/3">
-            <name>{project_name}</name>
-            <source-roots>
-                <root id="src.dir"/>
-            </source-roots>
-            <test-roots>
-                <root id="test.src.dir"/>
-            </test-roots>
-        </data>
-    </configuration>
-</project>"""
-
-    project_properties = f"""annotation.processing.enabled=true
-annotation.processing.enabled.in.editor=false
-annotation.processing.processors.list=
-annotation.processing.run.all.processors=true
-annotation.processing.source.output=${{build.generated.sources.dir}}/ap-source-output
-build.classes.dir=${{build.dir}}/classes
-build.classes.excludes=**/*.java,**/*.form
-build.dir=build
-build.generated.dir=${{build.dir}}/generated
-build.generated.sources.dir=${{build.dir}}/generated-sources
-build.sysclasspath=ignore
-build.test.classes.dir=${{build.dir}}/test/classes
-build.test.results.dir=${{build.dir}}/test/results
-debug.classpath=${{run.classpath}}
-debug.test.classpath=${{run.test.classpath}}
-dist.dir=dist
-dist.jar=${{dist.dir}}/{project_name}.jar
-dist.javadoc.dir=${{dist.dir}}/javadoc
-jar.compress=false
-javac.classpath=
-javac.compilerargs=
-javac.deprecation=false
-javac.external.vm=true
-javac.processorpath=${{javac.classpath}}
-javac.source=17
-javac.target=17
-javac.test.classpath=${{javac.classpath}}:${{build.classes.dir}}
-javac.test.processorpath=${{javac.test.classpath}}
-javadoc.additionalparam=
-javadoc.author=false
-javadoc.encoding=${{source.encoding}}
-javadoc.noindex=false
-javadoc.nonavbar=false
-javadoc.notree=false
-javadoc.private=false
-javadoc.splitindex=true
-javadoc.use=true
-javadoc.version=false
-javadoc.windowtitle=
-main.class={main_class}
-manifest.file=manifest.mf
-meta.inf.dir=${{src.dir}}/META-INF
-mkdist.disabled=false
-platform.active=default_platform
-run.classpath=${{javac.classpath}}:${{build.classes.dir}}
-run.jvmargs=
-run.test.classpath=${{javac.test.classpath}}:${{build.test.classes.dir}}
-source.encoding=UTF-8
-src.dir=src
-test.src.dir=test
-"""
-
-    build_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<project name="{project_name}" default="default" basedir=".">
-    <description>Builds, tests, and runs the project {project_name}.</description>
-    <import file="nbproject/build-impl.xml"/>
-</project>"""
-
-    manifest_mf = "Manifest-Version: 1.0\nX-COMMENT: Main-Class will be added automatically by build\n\n"
-
-    # --- Build the zip in memory ---
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        prefix = project_name
-
-        # NetBeans metadata
-        zf.writestr(f"{prefix}/nbproject/project.xml", project_xml)
-        zf.writestr(f"{prefix}/nbproject/project.properties", project_properties)
-        zf.writestr(f"{prefix}/build.xml", build_xml)
-        zf.writestr(f"{prefix}/manifest.mf", manifest_mf)
-
-        # Source files
-        for filepath, content in files.items():
-            zf.writestr(f"{prefix}/src/{filepath}", content)
-
-    buf.seek(0)
-    return buf
 
 
 # --- Moodle Helpers ---
@@ -348,7 +181,7 @@ def _regex_first(html, *patterns):
 
 def extract_page_params(html):
     """Extract sesskey, draftitemid, client_id, file list, and hidden form fields.
-    Uses only regex — no BeautifulSoup needed."""
+    Uses only regex - no BeautifulSoup needed."""
 
     # sesskey
     sesskey = _regex_first(html,
@@ -406,7 +239,7 @@ def extract_page_params(html):
         if isinstance(js_files, dict):
             js_files = list(js_files.values())
 
-    # Hidden form fields (for the save POST) — regex instead of BeautifulSoup
+    # Hidden form fields (for the save POST) - regex instead of BeautifulSoup
     hidden = {}
     for tag in re.finditer(r'<input[^>]+type=["\']hidden["\'][^>]*>', html):
         nm = re.search(r'name=["\']([^"\']+)["\']', tag.group(0))
@@ -437,20 +270,57 @@ def moodle_login(session):
 
         files_resp = session.get(FILES_URL, timeout=30)
         if 'name="logintoken"' in files_resp.text:
-            print("  Login failed — still on login page")
+            print("  Login failed - still on login page")
             return None
 
-        user = _regex_first(files_resp.text, r'loggedinuser[^>]*>([^<]+)<')
-        if user:
-            print(f"  Logged in as: {user.strip()}")
+        # Deliberately not printing the account name: Actions logs can be public.
+        print("  Logged in")
         return files_resp
     except requests.exceptions.RequestException as e:
         print(f"  Connection error: {e}")
         return None
 
 
+def text_answer_name(name):
+    return 'answers.txt' if name == 'questions.txt' else f"answers_{name}"
+
+
+def project_name_from(name):
+    """project_bank_system.txt -> BankSystem  (deterministic, so a finished question is never redone)"""
+    base = re.sub(r'^project_', '', os.path.splitext(name)[0])
+    parts = [p for p in re.split(r'[^A-Za-z0-9]+', base) if p]
+    return "".join(p[:1].upper() + p[1:] for p in parts) or "JavaProject"
+
+
+def answer_names(name):
+    """Every file name that counts as 'this question is already answered'."""
+    if name.startswith('project_'):
+        return [f"{project_name_from(name)}.zip", text_answer_name(name)]  # text = fallback answer
+    return [text_answer_name(name)]
+
+
+def make_answer(name, questions):
+    """Returns (payload_bytes, upload_name, mimetype). project_*.txt -> zipped NetBeans project."""
+    if name.startswith('project_'):
+        pname = project_name_from(name)
+        print(f"  {name}: PROJECT MODE - building NetBeans project '{pname}'")
+        try:
+            data, report = build_project(
+                pname, questions, lambda p, s, r: call_ai(p, s, r)[0], log=print)
+            if not report["ok"]:
+                print(f"  {name}: WARNING - not fully fixed, see BUILD_NOTES.txt inside the zip")
+            elif not report["verified"]:
+                print(f"  {name}: note - needs extra libraries, could not be compiled automatically")
+            return data, f"{pname}.zip", 'application/zip'
+        except Exception as e:
+            print(f"  {name}: project build failed ({e}); falling back to a text answer")
+    answers, model = call_ai(questions)
+    print(f"  {name}: answered via {model}")
+    return answers.encode('utf-8'), text_answer_name(name), 'text/plain'
+
+
 def upload_file(session, filename, filedata, mimetype, sesskey, itemid, client_id):
-    """Upload a file to Moodle draft area. Returns True on success."""
+    """Upload a file to the Moodle draft area. Returns True on success."""
     try:
         upload = session.post(
             f"{MOODLE_BASE_URL}/repository/repository_ajax.php?action=upload",
@@ -459,25 +329,33 @@ def upload_file(session, filename, filedata, mimetype, sesskey, itemid, client_i
                 'itemid': itemid, 'repo_id': '4',
                 'env': 'filemanager', 'sesskey': sesskey,
                 'client_id': client_id, 'savepath': '/',
+                'overwrite': 'true',  # replace an older answer if the question was edited
             },
-            files={'repo_upload_file': (filename, filedata, mimetype)},
-            timeout=60,
+            files={'repo_upload_file': (filename, io.BytesIO(filedata), mimetype)},
+            timeout=120,
         ).json()
     except Exception as e:
         print(f"  {filename}: upload failed: {e}")
         return False
-
     if 'error' in upload:
         print(f"  {filename}: upload error: {upload}")
         return False
-
     print(f"  {filename}: uploaded OK")
     return True
 
 
 # --- Main Loop ---
+def wait():
+    """Sleep one poll interval. Returns False when the time budget is used up."""
+    if time.time() + POLL_INTERVAL > DEADLINE:
+        return False
+    time.sleep(POLL_INTERVAL)
+    return True
+
+
 def main():
-    processed = {}  # filename -> last datemodified we processed
+    processed = {}    # filename -> datemodified we already handled in THIS run
+    retry_after = {}  # filename -> time before which we won't retry a failure
 
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=Retry(
@@ -489,7 +367,7 @@ def main():
     session.mount("https://", adapter)
     logged_in = False
 
-    print(f"Polling {MOODLE_BASE_URL} every {POLL_INTERVAL}s as {USERNAME}")
+    print(f"Polling {MOODLE_BASE_URL} every {POLL_INTERVAL}s")
 
     while True:
         try:
@@ -498,7 +376,8 @@ def main():
                 resp = session.get(FILES_URL, timeout=30)
             except requests.exceptions.RequestException as e:
                 print(f"Connection error: {e}")
-                time.sleep(POLL_INTERVAL)
+                if not wait():
+                    break
                 continue
 
             # 2. Login only if Moodle shows login form
@@ -507,7 +386,8 @@ def main():
                 resp = moodle_login(session)
                 if not resp:
                     logged_in = False
-                    time.sleep(POLL_INTERVAL)
+                    if not wait():
+                        break
                     continue
                 logged_in = True
             elif not logged_in:
@@ -516,8 +396,9 @@ def main():
             # 3. Extract page parameters
             sesskey, itemid, client_id, js_files, hidden = extract_page_params(resp.text)
             if not all([sesskey, itemid, client_id]):
-                print(f"Missing params: sesskey={sesskey}, itemid={itemid}, client_id={client_id}")
-                time.sleep(POLL_INTERVAL)
+                print("Missing page params (sesskey/itemid/client_id)")
+                if not wait():
+                    break
                 continue
 
             # 4. List files via AJAX
@@ -534,17 +415,25 @@ def main():
             if not all_files and js_files:
                 all_files = js_files
 
-            # 5. Filter for new/updated question files
-            new_files = [
-                f for f in all_files
-                if f.get('filename', '').endswith('.txt')
-                and not f.get('filename', '').startswith('answers_')
-                and f.get('filename') != 'answers.txt'
-                and f.get('datemodified', 0) > processed.get(f.get('filename', ''), 0)
-            ]
+            # 5. Stateless "is there work to do?" - the answer files in Moodle ARE the state,
+            #    so a fresh GitHub Actions run never redoes finished questions.
+            existing = {f.get('filename'): int(f.get('datemodified') or 0) for f in all_files}
+            now = time.time()
+            new_files = []
+            for f in all_files:
+                name = f.get('filename', '')
+                modified = int(f.get('datemodified') or 0)
+                if not name.endswith('.txt') or name.startswith('answers_') or name == 'answers.txt':
+                    continue
+                if modified <= processed.get(name, 0) or retry_after.get(name, 0) > now:
+                    continue
+                if any(existing.get(n, 0) >= modified for n in answer_names(name)):
+                    continue
+                new_files.append(f)
 
             if not new_files:
-                time.sleep(POLL_INTERVAL)
+                if not wait():
+                    break
                 continue
 
             # 6. Process each question file
@@ -553,7 +442,7 @@ def main():
 
             for f in new_files:
                 name = f['filename']
-                modified = f['datemodified']
+                modified = int(f.get('datemodified') or 0)
 
                 # Download
                 try:
@@ -568,57 +457,19 @@ def main():
                 questions = dl.text
                 print(f"  {name}: {len(questions)} chars")
 
-                # --- PROJECT MODE: project_*.txt → NetBeans zip ---
-                if name.startswith('project_'):
-                    print(f"  {name}: PROJECT MODE — generating NetBeans project...")
-                    try:
-                        ai_response, model = call_ai(questions, system_prompt=PROJECT_SYSTEM_PROMPT)
-                        print(f"  {name}: project code generated via {model}")
-                    except Exception as e:
-                        print(f"  {name}: AI failed: {e}")
-                        continue
-
-                    # Parse AI output into files
-                    project_files = parse_project_files(ai_response)
-                    if not project_files:
-                        print(f"  {name}: ERROR — AI returned no parseable files, falling back to text answer")
-                        # Fall through to normal text answer below
-                    else:
-                        # Derive project name from filename: project_calculator.txt → Calculator
-                        base = name.replace('project_', '').replace('.txt', '')
-                        project_name = base.title().replace(' ', '').replace('_', '')
-                        if not project_name:
-                            project_name = "JavaProject"
-
-                        print(f"  {name}: building NetBeans project '{project_name}' with {len(project_files)} source file(s):")
-                        for fp in project_files:
-                            print(f"    src/{fp}")
-
-                        # Build zip
-                        zip_buf = build_netbeans_zip(project_name, project_files)
-                        zip_name = f"{project_name}.zip"
-
-                        # Upload zip
-                        if upload_file(session, zip_name, zip_buf, 'application/zip',
-                                       sesskey, itemid, client_id):
-                            uploads += 1
-                            processed[name] = modified
-                        continue
-
-                # --- NORMAL MODE: regular .txt → text answer ---
+                # Build the answer: project_*.txt -> NetBeans zip, anything else -> text answer
                 try:
-                    answers, model = call_ai(questions)
-                    print(f"  {name}: answered via {model}")
+                    payload, ans_name, mime = make_answer(name, questions)
                 except Exception as e:
-                    print(f"  {name}: AI failed: {e}")
+                    print(f"  {name}: failed: {e}")
+                    retry_after[name] = time.time() + RETRY_AFTER_FAIL
                     continue
 
-                # Upload text answer
-                ans_name = 'answers.txt' if name == 'questions.txt' else f"answers_{name}"
-                if upload_file(session, ans_name, io.BytesIO(answers.encode('utf-8')),
-                               'text/plain', sesskey, itemid, client_id):
+                if upload_file(session, ans_name, payload, mime, sesskey, itemid, client_id):
                     uploads += 1
                     processed[name] = modified
+                else:
+                    retry_after[name] = time.time() + RETRY_AFTER_FAIL
 
             # 7. Save draft area to private files
             if uploads > 0:
@@ -639,9 +490,11 @@ def main():
             print(f"CRITICAL: {e}")
             traceback.print_exc()
 
-        time.sleep(POLL_INTERVAL)
+        if not wait():
+            break
+
+    print("Time budget used up - exiting.")
 
 
 if __name__ == "__main__":
     main()
-
