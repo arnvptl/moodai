@@ -16,7 +16,7 @@ MOODLE_BASE_URL = "http://103.117.208.18/moodle"
 FILES_URL = f"{MOODLE_BASE_URL}/user/files.php"
 LOGIN_URL = f"{MOODLE_BASE_URL}/login/index.php"
 POLL_INTERVAL = 5  # seconds between checks
-COOLDOWN_SECONDS = 60  # skip a model this long after it errors (rate limits etc.)
+COOLDOWN_SECONDS = 10  # skip a model this long after it errors (rate limits etc.)
 RETRY_AFTER_FAIL = 120  # don't retry a failed question file for this long
 
 USERNAME = os.getenv("MOODLE_USERNAME")
@@ -125,8 +125,12 @@ def call_ai(prompt, system=SYSTEM_PROMPT, role="coder"):
     Models that errored recently are tried last instead of being skipped entirely."""
     chain = ROLE_CHAINS.get(role, FALLBACK_CHAIN)
     now = time.time()
-    ordered = [k for k in chain if cooldown.get(k, 0) <= now] + \
-              [k for k in chain if cooldown.get(k, 0) > now]
+    ready = [k for k in chain if cooldown.get(k, 0) <= now]
+    waiting = [k for k in chain if cooldown.get(k, 0) > now]
+    if waiting:
+        skipped = ', '.join(f"{p}/{m}" for p, m in waiting)
+        print(f"  AI[{role}]: skipping (cooldown): {skipped}")
+    ordered = ready + waiting
     errors = []
     for provider, model in ordered:
         try:
