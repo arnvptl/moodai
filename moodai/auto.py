@@ -35,14 +35,29 @@ if GROQ_API_KEY:
     except (ImportError, Exception) as e:
         print(f"WARNING: Groq unavailable: {e}")
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+openrouter_client = None
+if OPENROUTER_API_KEY:
+    try:
+        from openai import OpenAI
+        openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+    except (ImportError, Exception) as e:
+        print(f"WARNING: OpenRouter unavailable: {e}")
+
 FALLBACK_CHAIN = [
-    ("gemini", "gemini-3.8-flash"),
-    ("groq",   "openai/gpt-oss-120b"),
-    ("gemini", "gemini-2.5-pro"),
-    ("groq",   "qwen/qwen3.8-27b"),
-    ("gemini", "gemini-3.6-flash"),
-    ("groq",   "openai/gpt-oss-20b"),
-    ("gemini", "gemini-3.5-flash-lite"),
+    ("gemini",     "gemini-3.8-flash"),
+    ("openrouter", "poolside/laguna-s-2.1:free"),
+    ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("groq",       "openai/gpt-oss-120b"),
+    ("groq",       "qwen/qwen3.8-27b"),
+    ("openrouter", "google/gemma-4-31b-it:free"),
+    ("gemini",     "gemini-3.6-flash"),
+    ("openrouter", "cohere/north-mini-code:free"),
+    ("groq",       "openai/gpt-oss-20b"),
+    ("gemini",     "gemini-3.5-flash-lite"),
 ]
 
 SYSTEM_PROMPT = (
@@ -57,7 +72,7 @@ SYSTEM_PROMPT = (
     "If the question is not about Java, just answer it normally in a simple and direct way."
 )
 
-print(f"MoodAI | {len(FALLBACK_CHAIN)} models | Groq: {'on' if groq_client else 'off'}")
+print(f"MoodAI | {len(FALLBACK_CHAIN)} models | Groq: {'on' if groq_client else 'off'} | OpenRouter: {'on' if openrouter_client else 'off'}")
 
 
 # --- AI Call with Fallback ---
@@ -65,7 +80,14 @@ def call_ai(prompt):
     """Try each model in order. Returns (answer, model_name) or raises."""
     errors = []
     for provider, model in FALLBACK_CHAIN:
-        client = gemini_client if provider == "gemini" else groq_client
+        if provider == "gemini":
+            client = gemini_client
+        elif provider == "groq":
+            client = groq_client
+        elif provider == "openrouter":
+            client = openrouter_client
+        else:
+            continue
         if client is None:
             continue
         try:
@@ -77,7 +99,7 @@ def call_ai(prompt):
                     ),
                 )
                 answer = resp.text
-            else:
+            else:  # groq and openrouter are both OpenAI-compatible
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[
